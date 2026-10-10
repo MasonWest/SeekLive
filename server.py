@@ -75,6 +75,7 @@ from socketserver import ThreadingMixIn
 import index_db
 import cache_db
 import trash_db
+import share_db
 
 # ---------- 编码健壮性（Windows 控制台） ----------
 try:
@@ -100,6 +101,7 @@ INDEX_DB = os.path.join(DATA_DIR, "index.db")
 CACHE_DB_MANIFEST = os.path.join(DATA_DIR, "cache.db")   # 缓存清单（回收缓存用）
 TRASH_DB = os.path.join(DATA_DIR, "trash.db")            # 回收站账本
 TRASH_DIR = os.path.join(DATA_DIR, "trash")              # 回收站文件区（必须在所有图库根目录之外）
+SHARE_DB = os.path.join(DATA_DIR, "shares.db")           # 分享账本（独立库；删掉它即完全回滚）
 # 时间覆盖表：给「既无 EXIF、编号也推不出」之外的疑难文件补时间
 # 由 tools/photo_time_repair.py 生成；不存在则完全跳过，不影响任何现有行为
 TS_OVERRIDES_CANDIDATES = (
@@ -234,6 +236,31 @@ _admin_sessions = {}                # sid -> 过期时间戳（0 = 不过期）
 _admin_lock = threading.Lock()
 _admin_fails = {}                   # ip -> {"n", "until", "at"}
 _admin_fail_lock = threading.Lock()
+
+# =========================================================
+#  访问控制（默认拒绝）+ 免登录分享
+# ---------------------------------------------------------
+#  ★ 与上面的「管理认证」是两层：
+#    · 管理认证（sl_admin）决定「能不能删 / 能不能改」；
+#    · 访问控制（本节）决定「能不能读 / 能读哪些」。
+#  角色：admin（sl_admin 会话）> share（sl_share Cookie，仅授权集合）> anon。
+#  机制：**默认拒绝** —— do_GET 分派前先过 read_guard()，只有匿名白名单放行。
+#  这样新增接口默认就是受保护的，不会因为「忘了加 auth」而漏。
+#  本机 / 局域网 / 反向代理公网走**同一套判定**，不设旁路。
+# =========================================================
+SHARE_COOKIE = "sl_share"
+SHARES = None                       # share_db.ShareStore：分享账本
+ACCESS_CFG = {                      # 由 load_access_cfg() 从 libraries.json 的 access 段读入
+    "protectRead": True,            # 默认：只读接口默认拒绝
+    "shareEnabled": True,           # 是否允许创建/访问分享
+    "cookieSecure": "auto",         # always | never | auto（按 X-Forwarded-Proto）
+    "pepper": "",                   # 令牌摘要可选加盐（HMAC-SHA256），默认不加
+    "defaultExpireDays": 0,         # 创建分享时未指定则用的默认有效天数（0 = 不过期）
+    "maxItems": 5000,               # 单条分享允许的最大照片数（防止一次性把整库塞进快照）
+}
+# 保护是否真正生效。**只有**「配置要求保护」且「确实配了管理口令」时才为真 ——
+# 未配口令则无人能通过认证，若仍开启保护会把站点锁死；此时降级为关并打印醒目警告。
+ACCESS_PROTECT = True
 
 # =========================================================
 #  索引进度（轻量：一个 dict + 一把锁，**不引入任何任务系统**）
@@ -1353,15 +1380,17 @@ def _empty_entry(entry, stale=False):
 
 
 def _open_stores():
-    """打开索引 / 缓存清单 / 回收站账本（幂等）。放在监听端口之前同步完成，
+    """打开索引 / 缓存清单 / 回收站账本 / 分享账本（幂等）。放在监听端口之前同步完成，
     这样后台索引期间到来的请求也能正常读到索引，不会 500。"""
-    global INDEX, CACHE_INDEX, TRASH
+    global INDEX, CACHE_INDEX, TRASH, SHARES
     if INDEX is None:
         INDEX = index_db.Index(INDEX_DB)
     if CACHE_INDEX is None:
         CACHE_INDEX = cache_db.CacheIndex(CACHE_DB_MANIFEST)
     if TRASH is None:
         TRASH = trash_db.Trash(TRASH_DB)
+    if SHARES is None:
+        SHARES = share_db.ShareStore(SHARE_DB)
 
 
 def load_libraries(full=False, mode="startup"):
@@ -3440,6 +3469,145 @@ def parse_range(header, total):
 
 
 # =========================================================
+#  访问控制：配置 / 令牌 / 分享视图（纯函数，供 Handler 调用）
+# =========================================================
+def load_access_cfg():
+    """
+    读取 libraries.json 的 `access` 段（与其它配置一样，文件缺失即用默认值）。
+
+    结果写入模块级 ACCESS_CFG / ACCESS_PROTECT。**必须在 set_admin_config() 之后调用**
+    —— 因为「保护是否生效」取决于是否真的配了管理口令。
+    """
+    global ACCESS_CFG, ACCESS_PROTECT
+    cfg = {}
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+    except Exception as e:
+        log.error("libraries.json 读取失败（访问控制用默认值）：%s", e)
+        cfg = {}
+    acc = cfg.get("access") or {}
+    shr = acc.get("share") or {}
+    try:
+        exp_days = int(shr.get("defaultExpireDays", 0) or 0)
+    except (TypeError, ValueError):
+        exp_days = 0
+    try:
+        max_items = int(acc.get("maxItems", 5000) or 5000)
+    except (TypeError, ValueError):
+        max_items = 5000
+    mode = str(shr.get("cookieSecure", "auto") or "auto").lower()
+    if mode not in ("auto", "always", "never"):
+        mode = "auto"
+    ACCESS_CFG = {
+        "protectRead": bool(acc.get("protectRead", True)),
+        "shareEnabled": bool(shr.get("enabled", True)),
+        "cookieSecure": mode,
+        "pepper": str(shr.get("pepper", "") or ""),
+        "defaultExpireDays": max(0, exp_days),
+        "maxItems": max(1, max_items),
+    }
+    ACCESS_PROTECT = ACCESS_CFG["protectRead"] and admin_required()
+    return ACCESS_CFG
+
+
+def share_token_hash(tok):
+    """令牌 → 摘要（只存摘要，明文不落盘）。配了 pepper 则用 HMAC-SHA256。"""
+    tok = str(tok or "")
+    pepper = ACCESS_CFG.get("pepper") or ""
+    if pepper:
+        return hmac.new(pepper.encode("utf-8"), tok.encode("utf-8"),
+                        hashlib.sha256).hexdigest()
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()
+
+
+def new_share_token():
+    """256 bit 随机令牌：不可枚举、非日期、非自增 ID。明文只回显一次。"""
+    return secrets.token_urlsafe(32)
+
+
+def share_rec_by_token(tok):
+    """
+    按令牌取**仍有效**的分享记录（未撤销、未过期），并附上授权集合。
+
+    ★ 每个请求都重新查库判定，**不缓存结论** → 撤销/过期后下一次请求立即被拒。
+      这是「撤销即时生效」的实现要点（另一半是 CF 必须 Bypass，见 README）。
+    """
+    if SHARES is None or not tok:
+        return None
+    rec = SHARES.lookup_by_token(share_token_hash(tok))
+    if not share_db.ShareStore.is_active(rec):
+        return None
+    return share_with_allowed(rec)
+
+
+def share_with_allowed(rec):
+    """给记录附上 allowed / allowed_mov 两个集合（同一请求内复用，跨请求不缓存）。"""
+    if rec is None:
+        return None
+    items = SHARES.items_of(rec["share_id"]) if SHARES else []
+    rec["items"] = items
+    rec["allowed"] = {it["rel"] for it in items if it.get("rel")}
+    rec["allowed_mov"] = {it["mov_rel"] for it in items if it.get("mov_rel")}
+    return rec
+
+
+def share_public(rec, lib=None):
+    """分享的对外元信息（不泄露令牌、不泄露集合外的任何东西）。"""
+    if not rec:
+        return None
+    return {
+        "title": rec.get("title") or "分享照片",
+        "count": int(rec.get("n_items") or 0),
+        "lib": rec.get("lib_id") or "",
+        "libName": (lib or {}).get("name") or rec.get("lib_id") or "",
+        "kind": rec.get("kind") or "items",
+        "createdAt": int(rec.get("created_at") or 0),
+        "expiresAt": int(rec.get("expires_at") or 0),
+    }
+
+
+def share_lib_view(lib, rec):
+    """
+    按授权集合在**内存索引**上重建一个「虚拟图库」（结构同 index_db.build_index）。
+    分享访客的 tree/items/search/item 全部走这个视图 —— 集合外的条目拿不到。
+    视图随请求即时构建（不落盘、不缓存），所以撤销/集合变化不会留下残留。
+    """
+    allowed = rec.get("allowed") or set()
+    items = [it for it in lib["items"] if it["p"] in allowed]
+    by_day = collections.defaultdict(list)
+    day_order = []
+    for it in items:
+        lt = time.localtime(it["t"])
+        key = time.strftime("%Y-%m", lt) + "|" + time.strftime("%d", lt)
+        if key not in by_day:
+            day_order.append(key)
+        by_day[key].append(it)
+    months = collections.OrderedDict()
+    for key in day_order:
+        ym, dd = key.split("|")
+        m = months.setdefault(ym, {"ym": ym, "n": 0, "days": []})
+        m["n"] += len(by_day[key])
+        m["days"].append({"d": dd, "n": len(by_day[key]),
+                          "ts": by_day[key][0]["t"]})
+    return {"id": lib["id"], "name": lib.get("name") or lib["id"],
+            "items": items, "by_day": dict(by_day),
+            "day_order": day_order, "months": list(months.values()),
+            "count": len(items)}
+
+
+def share_lib_public(lib, view):
+    """分享作用域下的图库公开信息：只暴露数量，不暴露路径 / 管理能力。"""
+    return {"id": lib["id"], "name": lib.get("name") or lib["id"],
+            "count": view.get("count", 0), "live": 0, "exists": True,
+            "scanMs": 0, "stale": False, "movParsed": 0,
+            "added": 0, "changed": 0, "removed": 0,
+            "readonly": True, "deletionEnabled": False,
+            "canManage": False, "manageReason": "分享访客仅可见，不能管理"}
+
+
+# =========================================================
 #  HTTP 服务
 # =========================================================
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -3465,8 +3633,21 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "SeekLive/1.0"
 
+    # ★★ 关键：HTTP/1.1 是 keep-alive —— 同一个 TCP 连接上的**多个请求会复用同一个
+    #    Handler 实例**（BaseHTTPRequestHandler.handle 循环调用 handle_one_request）。
+    #    因此任何挂在 self 上的「单请求缓存」都必须在每个请求开始时清掉，
+    #    否则会把上一个请求的身份判定（尤其是 share→admin 的越权 / 撤销后仍放行）
+    #    带到下一个请求上。这里显式复位所有单请求状态。
+    def handle_one_request(self):
+        self._scope = None        # 身份判定的单请求缓存（read_scope）
+        self._body_raw = None     # POST 预读的请求体缓存
+        return super().handle_one_request()
+
     def log_message(self, fmt, *a):
-        log.info("%s - %s", self.client_address[0], fmt % a)
+        # ★ 分享令牌会出现在 /s/<token> 的请求行里 —— 日志一律脱敏，
+        #   避免明文令牌被写进 logs/server.log（也避免随日志外泄）。
+        msg = re.sub(r"/s/[A-Za-z0-9_\-]+", "/s/***", fmt % a)
+        log.info("%s - %s", self.client_address[0], msg)
 
     # ---------- 管理认证（只作用于源文件管理，不作用于浏览）----------
     def cookie_val(self, name):
@@ -3545,6 +3726,139 @@ class Handler(BaseHTTPRequestHandler):
     def send_err(self, code, msg):
         self.send_bytes(f"{code} {msg}".encode(), "text/plain; charset=utf-8", code)
 
+    # ---------- 访问控制：统一只读守卫（默认拒绝）----------
+    def share_token(self):
+        return self.cookie_val(SHARE_COOKIE)
+
+    def read_scope(self):
+        """
+        本次请求的身份：('admin', None) / ('share', rec) / ('anon', None)。
+
+        结果在**同一请求内**缓存（供 read_guard / media_guard 复用，避免重复查库），
+        **跨请求绝不缓存** → 撤销 / 过期在下一次请求即生效。
+        注意 keep-alive：同一连接的多个请求复用同一个 Handler 实例，因此
+        `handle_one_request()` 会在每个请求开始时把 `self._scope` 清空。
+        """
+        cached = getattr(self, "_scope", None)
+        if cached is not None:
+            return cached
+        if self.admin_authed():
+            out = ("admin", None)
+        else:
+            rec = share_rec_by_token(self.share_token())
+            out = ("share", rec) if rec else ("anon", None)
+        self._scope = out
+        return out
+
+    def cookie_secure(self):
+        """分享 Cookie 是否加 Secure。auto：本服务自身不跑 TLS，以反向代理头为准。"""
+        mode = ACCESS_CFG.get("cookieSecure") or "auto"
+        if mode == "always":
+            return True
+        if mode == "never":
+            return False
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0]
+        return proto.strip().lower() == "https"
+
+    def send_denied(self, code, msg):
+        """拒绝访问：保留语义（401 未登录 / 403 无权限），便于前端分流。"""
+        scope, _ = self.read_scope()
+        body = {"error": msg, "scope": scope}
+        if code == 401:
+            body["needAuth"] = True
+        self.send_bytes(json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8", code)
+
+    # 匿名白名单：**除这些之外一律需要授权**（新增接口默认受保护，不会漏）。
+    #   静态外壳（页面/JS/CSS）匿名 → 前端拿到壳后用 /api/session 自判身份；
+    #   /s/<token> 是分享落地页，凭 URL 里的令牌自校验。
+    ANON_GET = frozenset({
+        "/", "/index.html", "/app.css", "/app.js", "/favicon.svg",
+        "/manifest.webmanifest",
+        "/api/session",          # 统一身份接口（只回身份，不含任何相册数据）
+        "/api/admin/status",     # 兼容保留
+    })
+    # 分享访客可读的路径；**具体到哪一张**由 media_guard / share_lib_view 逐条判定。
+    SHARE_GET = frozenset({
+        "/api/libs", "/api/tree", "/api/items", "/api/search", "/api/item",
+        "/thumb", "/photo", "/raw", "/video",
+    })
+
+    def read_guard(self, path):
+        """分派前的统一守卫。返回 (code, msg) 或 None（放行）。
+
+        守卫**只做判定与拦截**，不执行业务逻辑 —— 因为 do_HEAD 直接复用 do_GET，
+        所以 HEAD 与 GET 受完全相同的约束，且不会产生任何副作用。
+        """
+        if not ACCESS_PROTECT:
+            return None            # 未配置口令：无法认证 → 保护不生效（启动时有醒目警告）
+        if path in self.ANON_GET or path.startswith("/s/"):
+            return None
+        scope, _ = self.read_scope()
+        if scope == "admin":
+            return None
+        if scope == "share":
+            if path in self.SHARE_GET:
+                return None
+            return 403, "该资源不在你的分享范围内"
+        return 401, "需要访问授权"
+
+    def admin_guard(self, need_header=True):
+        """非 lib 级的管理闸门（/api/refresh、/api/cache/gc、分享管理）。返回 (code,msg)|None。"""
+        if not admin_required():
+            return 403, "未配置管理口令：该功能已禁用（浏览不受影响）"
+        if not self.admin_authed():
+            return 401, "需要管理授权"
+        if need_header and not self.csrf_ok():
+            return 403, "缺少管理请求头（X-SL-Admin）"
+        if need_header and not self.same_origin_ok():
+            return 403, "来源校验未通过（跨站请求已拒绝）"
+        return None, None
+
+    def media_guard(self, lib, rel):
+        """媒体逐请求授权：admin 放行；share 需 (lib,rel) 在集合内（含配对视频）；anon 拒绝。
+
+        ★ 与 safe_resolve() 的路径校验**同时成立**才真正读到文件：
+          路径校验保证「不出图库」，授权保证「属于这次分享」。
+        """
+        if not ACCESS_PROTECT:
+            return None
+        scope, rec = self.read_scope()
+        if scope == "admin":
+            return None
+        if scope == "share":
+            if not lib or rec.get("lib_id") != lib.get("id"):
+                return 403, "该资源不在分享范围内"
+            if rel in (rec.get("allowed") or set()) or rel in (rec.get("allowed_mov") or set()):
+                return None
+            return 403, "该资源不在分享范围内"
+        return 401, "需要访问授权"
+
+    def media_admin_only(self):
+        """回收站媒体：share 与 anon 一律拒绝（回收站**只给 admin**）。"""
+        if not ACCESS_PROTECT:
+            return None, None
+        scope, _ = self.read_scope()
+        if scope == "admin":
+            return None, None
+        return ((403, "回收站仅管理员可访问") if scope == "share"
+                else (401, "需要访问授权"))
+
+    def media_cache(self, default):
+        """媒体缓存策略：share 一律 private,no-store（撤销要即时生效）；admin 保持 public。"""
+        scope, _ = self.read_scope()
+        return "private, no-store" if scope == "share" else default
+
+    def share_cookie_value(self, tok, rec):
+        """组装 sl_share：Path=/ 必须（否则 /thumb 等非子目录请求带不上 Cookie）。"""
+        parts = [f"{SHARE_COOKIE}={tok}", "Path=/", "HttpOnly", "SameSite=Lax"]
+        if self.cookie_secure():
+            parts.append("Secure")
+        exp = int(rec.get("expires_at") or 0)
+        if exp:
+            parts.append(f"Max-Age={max(0, exp - int(time.time()))}")
+        return "; ".join(parts)
+
     # ---------- 路由 ----------
     def do_HEAD(self):
         self.do_GET()
@@ -3554,24 +3868,24 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.unquote(parsed.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
-        # ★ 浏览路径完全匿名：这里刻意没有任何认证分支。
-        #   /、静态资源、/api/libs、/api/tree、/api/items、/api/search、/api/item、
-        #   /thumb、/photo、/raw、/video 一律不需要任何凭证。
-        #   认证只出现在 do_POST 的管理接口里（mgmt_guard）。
+        # ★ 统一只读守卫：**默认拒绝**，只有匿名白名单（静态外壳 / 状态接口 /
+        #   分享落地页）放行；其余一律先判身份再路由。
+        #   do_HEAD 直接复用本方法 → HEAD 与 GET 受完全相同的约束。
+        denied = self.read_guard(path)
+        if denied:
+            return self.send_denied(*denied)
+
+        # ---- 免登录分享：落地页（凭 URL 令牌换取 sl_share Cookie）----
+        if path.startswith("/s/"):
+            return self.serve_share_landing(path[3:])
 
         # ---- API ----
+        if path == "/api/session":
+            return self.api_session()
         if path == "/api/admin/status":
             return self.api_admin_status()
         if path == "/api/libs":
-            return self.send_json({
-                "libraries": [lib_public(META["libs"][i])
-                              for i in META["lib_order"] if i in META["libs"]],
-                "trash": {"retentionDays": int((META.get("trash") or DEFAULT_TRASH
-                                                ).get("retentionDays") or 30)},
-                # 首次索引可能还在后台跑：前端据此显示进度面板而不是「没有照片」
-                "indexing": bool(idx_get().get("running")),
-                "ready": BOOTSTRAP_DONE.is_set(),
-            })
+            return self.api_libs()
         if path == "/api/index/progress":
             return self.api_index_progress()
         if path == "/api/tree":
@@ -3640,6 +3954,13 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 索引维护（非破坏性；全量重建才要管理授权）----
         if path == "/api/index/scan":
             return self.api_index_scan()
+        # ---- 分享管理（管理端；经 admin_guard + CSRF 头）----
+        if path == "/api/share/create":
+            return self.api_share_create()
+        if path == "/api/share/list":
+            return self.api_share_list()
+        if path == "/api/share/revoke":
+            return self.api_share_revoke()
         # ---- 源文件管理（全部经 mgmt_guard 四道闸门）----
         if path == "/api/delete":
             return self.api_delete(qs)
@@ -3686,6 +4007,166 @@ class Handler(BaseHTTPRequestHandler):
             "sessionHours": float(ADMIN_CFG.get("sessionHours") or 0),
             "source": ADMIN_SOURCE if admin_required() else "",
         })
+
+    # ---------- 统一身份 / 图库列表 / 分享落地 ----------
+    def api_session(self):
+        """
+        GET /api/session —— 统一只读身份接口（anon / share / admin）。
+
+        前端**只依据本接口**判断身份；绝不用 URL 上 ?share=1 之类的提示参数当凭证
+        —— 那只是 UI 提示，不是授权。
+        """
+        scope, rec = self.read_scope()
+        out = {"scope": scope,
+               "protectRead": bool(ACCESS_PROTECT),
+               "adminRequired": admin_required(),
+               "shareEnabled": bool(ACCESS_CFG.get("shareEnabled")),
+               "canManage": scope == "admin",
+               "admin": {"authed": scope == "admin",
+                         "expiresAt": (admin_session_expires(self.admin_sid()) or 0)
+                                      if scope == "admin" else 0,
+                         "sessionHours": float(ADMIN_CFG.get("sessionHours") or 0),
+                         "source": ADMIN_SOURCE if admin_required() else ""}}
+        if scope == "share":
+            out["share"] = share_public(rec, META["libs"].get(rec.get("lib_id")))
+        return self.send_json(out)
+
+    def api_libs(self):
+        """GET /api/libs —— admin 见全部图库；share 只见被分享的那一个（数量=授权数）。"""
+        scope, rec = self.read_scope()
+        if scope == "share":
+            lib = META["libs"].get(rec.get("lib_id"))
+            libs = [share_lib_public(lib, share_lib_view(lib, rec))] if lib else []
+            return self.send_json({
+                "libraries": libs, "trash": {"retentionDays": 0},
+                "indexing": False, "ready": True,
+                "scope": "share", "share": share_public(rec, lib)})
+        return self.send_json({
+            "libraries": [lib_public(META["libs"][i])
+                          for i in META["lib_order"] if i in META["libs"]],
+            "trash": {"retentionDays": int((META.get("trash") or DEFAULT_TRASH
+                                            ).get("retentionDays") or 30)},
+            # 首次索引可能还在后台跑：前端据此显示进度面板而不是「没有照片」
+            "indexing": bool(idx_get().get("running")),
+            "ready": BOOTSTRAP_DONE.is_set(),
+            "scope": scope})
+
+    def serve_share_landing(self, tok):
+        """
+        GET /s/<token> —— 校验令牌 → 种 sl_share Cookie → 302 到相册。
+
+        令牌无效时**统一 404**，不区分「不存在」与「已撤销」：
+        否则这个接口会变成「哪些分享曾经存在」的探测器。
+        """
+        if not (ACCESS_PROTECT and ACCESS_CFG.get("shareEnabled")):
+            return self.send_err(404, "分享功能未开启")
+        rec = share_rec_by_token(tok)
+        if not rec:
+            return self.send_err(404, "分享链接不存在或已失效")
+        self.send_bytes(b"", "text/html; charset=utf-8", 302,
+                        extra={"Location": "/?share=1",
+                               "Set-Cookie": self.share_cookie_value(tok, rec)},
+                        cache="no-store")
+
+    # ---------- 分享管理（管理端；全部经 admin_guard + CSRF 头）----------
+    def api_share_create(self):
+        """POST /api/share/create {lib, rels:[...], title, expireDays, kind}
+
+        ★ 把**创建那一刻**的授权集合固化成快照：之后相册里新增 / 移动 / 重新索引，
+          都不会悄悄改变已发出分享的范围。
+        """
+        code, msg = self.admin_guard()
+        if code:
+            return self.send_mgmt_err(code, msg)
+        if not ACCESS_CFG.get("shareEnabled"):
+            return self.send_err(403, "分享功能已被配置关闭")
+        if SHARES is None:
+            return self.send_err(503, "分享账本不可用")
+        body = self.read_json()
+        lid = str(body.get("lib") or "").strip()
+        lib = META["libs"].get(lid)
+        if not lib:
+            return self.send_err(404, "library not found")
+        rels = body.get("rels")
+        if rels is None:
+            rels = body.get("items")
+        if not isinstance(rels, list) or not rels:
+            return self.send_err(400, "需要 rels（照片相对路径列表）")
+        rels = [str(r) for r in rels]
+        if len(rels) > ACCESS_CFG["maxItems"]:
+            return self.send_err(400, f"单条分享最多 {ACCESS_CFG['maxItems']} 张")
+        by_rel = {it["p"]: it for it in lib["items"]}
+        picked, missing = [], []
+        for r in rels:
+            it = by_rel.get(r)
+            if not it:
+                missing.append(r)
+                continue
+            mv = it.get("mv") if (it.get("k") == "img" and it.get("lv") == 1) else None
+            picked.append({"rel": it["p"], "mov_rel": mv})
+        if not picked:
+            return self.send_err(400, "没有有效的照片（路径不在索引里）")
+        title = str(body.get("title") or "").strip()
+        try:
+            days = int(body.get("expireDays") or 0)
+        except (TypeError, ValueError):
+            days = 0
+        if days < 0:
+            days = 0
+        if not days:
+            days = int(ACCESS_CFG.get("defaultExpireDays") or 0)
+        expires_at = int(time.time() + days * 86400) if days > 0 else 0
+        kind = "month" if str(body.get("kind") or "") == "month" else "items"
+        tok = new_share_token()
+        rec = SHARES.create(share_token_hash(tok), lib["id"], picked,
+                            title=title or f"{lib['name']} 分享",
+                            kind=kind, expires_at=expires_at)
+        if not rec:
+            return self.send_err(500, "创建分享失败")
+        log.info("分享已创建：%s（%d 张，%s）", rec["share_id"], rec["n_items"],
+                 "不过期" if not expires_at else f"{days} 天后过期")
+        return self.send_json({"ok": True, "share": share_public(rec, lib),
+                               "token": tok, "url": f"/s/{tok}", "skipped": missing})
+
+    def api_share_list(self):
+        """POST /api/share/list {lib?} —— 只回元信息，**绝不回显令牌**。"""
+        code, msg = self.admin_guard()
+        if code:
+            return self.send_mgmt_err(code, msg)
+        body = self.read_json()
+        lid = str(body.get("lib") or "").strip() or None
+        rows = SHARES.list_shares(lid, include_dead=False) if SHARES else []
+        now = int(time.time())
+        out = []
+        for r in rows:
+            d = share_public(r, META["libs"].get(r.get("lib_id")))
+            d["id"] = r["share_id"]
+            d["expiresIn"] = (int(r["expires_at"]) - now) if r.get("expires_at") else 0
+            out.append(d)
+        return self.send_json({"shares": out,
+                               "enabled": bool(ACCESS_CFG.get("shareEnabled"))})
+
+    def api_share_revoke(self):
+        """POST /api/share/revoke {id} 或 {ids:[...]} —— 撤销后**立即**失效（页面 + 媒体）。"""
+        code, msg = self.admin_guard()
+        if code:
+            return self.send_mgmt_err(code, msg)
+        if SHARES is None:
+            return self.send_err(503, "分享账本不可用")
+        body = self.read_json()
+        ids = body.get("ids")
+        if ids is None:
+            ids = [body.get("id")] if body.get("id") else []
+        if not isinstance(ids, list):
+            ids = [ids]
+        ids = [str(x) for x in ids if x]
+        if not ids:
+            return self.send_err(400, "需要 id 或 ids")
+        n = 0
+        for i in ids:
+            if SHARES.revoke(i):
+                n += 1
+        return self.send_json({"ok": True, "revoked": n, "requested": len(ids)})
 
     def api_admin_login(self):
         ip = self.client_address[0] if self.client_address else "-"
@@ -3992,7 +4473,10 @@ class Handler(BaseHTTPRequestHandler):
         return it, path, None, None
 
     def serve_trash_image(self, qs):
-        """回收站缩略图 / 视频首帧（走与 /thumb 同一套磁盘缓存与抽帧）。"""
+        """回收站缩略图 / 视频首帧（走与 /thumb 同一套磁盘缓存与抽帧）。**仅 admin**。"""
+        code, msg = self.media_admin_only()
+        if code:
+            return self.send_denied(code, msg)
         it, fp, code, msg = self._resolve_trash(qs)
         if code:
             return self.send_err(code, msg)
@@ -4011,7 +4495,10 @@ class Handler(BaseHTTPRequestHandler):
                                cache="public, max-age=600")
 
     def serve_trash_media(self, qs):
-        """回收站内原始文件（Range 流式），用于预览被删除的视频。"""
+        """回收站内原始文件（Range 流式），用于预览被删除的视频。**仅 admin**。"""
+        code, msg = self.media_admin_only()
+        if code:
+            return self.send_denied(code, msg)
         it, fp, code, msg = self._resolve_trash(qs)
         if code:
             return self.send_err(code, msg)
@@ -4026,16 +4513,34 @@ class Handler(BaseHTTPRequestHandler):
         return self._stream_file(fp, 0, total - 1, total, ctype, 200)
 
     # ---------- API 实现 ----------
-    def api_tree(self, qs):
+    def _scope_container(self, qs):
+        """返回本次请求该用的「库容器」：admin → 真图库；share → 授权集合的虚拟视图。
+
+        返回 (lib, cont, err)：err 为 (code, msg) 时直接回错。
+        """
         lib = get_lib(qs)
         if not lib:
-            return self.send_err(404, "library not found")
+            return None, None, (404, "library not found")
+        scope, rec = self.read_scope()
+        if scope == "share":
+            if rec.get("lib_id") != lib["id"]:
+                return lib, None, (403, "该图库不在你的分享范围内")
+            return lib, share_lib_view(lib, rec), None
+        return lib, lib, None
+
+    def api_tree(self, qs):
+        lib, cont, err = self._scope_container(qs)
+        if err:
+            return self.send_err(*err)
+        pub = lib_public(lib)
+        if cont is not lib:
+            pub = share_lib_public(lib, cont)
         return self.send_json({
-            "lib": lib_public(lib),
+            "lib": pub,
             "months": [{"ym": m["ym"], "n": m["n"],
                         "days": [{"d": d["d"], "n": d["n"]} for d in m["days"]]}
-                       for m in lib["months"]],
-            "dayOrder": lib["day_order"],
+                       for m in cont["months"]],
+            "dayOrder": cont["day_order"],
         })
 
     def api_items(self, qs):
@@ -4044,10 +4549,12 @@ class Handler(BaseHTTPRequestHandler):
         - 指定 ym+d → 该日全量（分页）
         - 只指定 ym  → 该月全量（分页）
         - 都不指定   → 全部（分页，供搜索/全部视图）
+
+        ★ share 作用域下，`src` 来自**授权集合的虚拟视图** —— 集合外的条目拿不到。
         """
-        lib = get_lib(qs)
-        if not lib:
-            return self.send_err(404, "library not found")
+        lib, cont, err = self._scope_container(qs)
+        if err:
+            return self.send_err(*err)
         ym = (qs.get("ym") or [""])[0]
         dd = (qs.get("d") or [""])[0]
         off = max(0, int((qs.get("off") or ["0"])[0] or 0))
@@ -4055,16 +4562,16 @@ class Handler(BaseHTTPRequestHandler):
         sort = (qs.get("sort") or ["desc"])[0]
 
         if ym and dd:
-            src = lib["by_day"].get(ym + "|" + dd, [])
+            src = cont["by_day"].get(ym + "|" + dd, [])
         elif ym:
             src = []
-            for m in lib["months"]:
+            for m in cont["months"]:
                 if m["ym"] == ym:
                     for d in m["days"]:
-                        src.extend(lib["by_day"].get(ym + "|" + d["d"], []))
+                        src.extend(cont["by_day"].get(ym + "|" + d["d"], []))
                     break
         else:
-            src = lib["items"]
+            src = cont["items"]
         if sort == "asc":
             # 仅在不分页语义下安全；分页时按切片再反转
             total = len(src)
@@ -4077,31 +4584,33 @@ class Handler(BaseHTTPRequestHandler):
                                "items": [self.item_public(it) for it in page]})
 
     def api_search(self, qs):
-        lib = get_lib(qs)
-        if not lib:
-            return self.send_err(404, "library not found")
+        lib, cont, err = self._scope_container(qs)
+        if err:
+            return self.send_err(*err)
         kw = (qs.get("q") or [""])[0].strip().lower()
         off = max(0, int((qs.get("off") or ["0"])[0] or 0))
         lim = min(600, max(1, int((qs.get("lim") or ["120"])[0] or 120)))
         if not kw:
             return self.send_json({"total": 0, "off": off, "lim": lim, "items": []})
-        hits = [it for it in lib["items"] if kw in it["n"].lower()]
+        hits = [it for it in cont["items"] if kw in it["n"].lower()]
         return self.send_json({"total": len(hits), "off": off, "lim": lim,
                                "items": [self.item_public(it)
                                          for it in hits[off:off + lim]]})
 
     def api_item(self, qs):
-        lib = get_lib(qs)
-        if not lib:
-            return self.send_err(404, "library not found")
+        lib, cont, err = self._scope_container(qs)
+        if err:
+            return self.send_err(*err)
         rel = (qs.get("p") or [""])[0]
-        for it in lib["items"]:
-            if it["p"] == rel:
+        for it in cont["items"]:
+            if it["p"] == rel or it["mv"] == rel:
                 return self.send_json(self.item_public(it))
-        # 也可能传的是 movie 路径
-        for it in lib["items"]:
-            if it["mv"] == rel:
-                return self.send_json(self.item_public(it))
+        # share 作用域下，路径确实存在但不属于这次分享 → 403（有身份、无权限），
+        # 而不是 404 —— 与媒体接口的语义保持一致。
+        if cont is not lib:
+            for it in lib["items"]:
+                if it["p"] == rel or it["mv"] == rel:
+                    return self.send_err(403, "该照片不在你的分享范围内")
         return self.send_err(404, "item not found")
 
     def api_stats(self):
@@ -4208,7 +4717,15 @@ class Handler(BaseHTTPRequestHandler):
           ?adopt=1            先收养既有缓存再判定
           ?full=1             深度全量扫描（能发现清单外、目录又没被动过的历史遗留文件；慢）
         删除范围严格限制在 cache/ 目录内，绝不触碰源照片。
+
+        ★ 本接口**有副作用**（可删缓存文件），因此不再是匿名可调：
+          必须带有效管理会话 + X-SL-Admin 头（与 /api/refresh 一致）。
         """
+        if not ACCESS_PROTECT and not admin_required():
+            return self.send_mgmt_err(403, "未配置管理口令：该功能已禁用")
+        code, msg = self.admin_guard()
+        if code:
+            return self.send_mgmt_err(code, msg)
         if (qs.get("adopt") or ["0"])[0] == "1":
             cache_adopt()
         raw = (qs.get("cls") or [""])[0].strip()
@@ -4223,7 +4740,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json(cache_gc_plan(classes, True, deep))
 
     def api_refresh(self, qs):
-        """手动刷新索引。/api/refresh?lib=<id|all>&full=0|1"""
+        """手动刷新索引。/api/refresh?lib=<id|all>&full=0|1
+
+        ★ 本接口会写盘 / 改索引状态，与 /api/cache/gc 一样纳入管理授权。
+        """
+        if not ACCESS_PROTECT and not admin_required():
+            return self.send_mgmt_err(403, "未配置管理口令：该功能已禁用")
+        code, msg = self.admin_guard()
+        if code:
+            return self.send_mgmt_err(code, msg)
         lid = (qs.get("lib") or ["all"])[0]
         full = (qs.get("full") or ["0"])[0] == "1"
         targets = META["lib_order"] if lid in ("all", "") else [lid]
@@ -4259,7 +4784,17 @@ class Handler(BaseHTTPRequestHandler):
             return lib, rel, None, 404, "文件不存在"
         return lib, rel, fp, None, None
 
+    def _media_precheck(self, qs):
+        """媒体请求的**前置授权**：在读盘/解析路径**之前**判定，避免用 403/404 的差异
+        泄露「某个文件是否存在」。返回 (code, msg) 或 (None, None)。"""
+        lib = get_lib(qs)
+        rel = (qs.get("p") or [""])[0]
+        return self.media_guard(lib, rel) or (None, None)
+
     def serve_image(self, qs, kind):
+        code, msg = self._media_precheck(qs)
+        if code:
+            return self.send_denied(code, msg)
         lib, rel, fp, code, msg = self._resolve(qs)
         if code:
             return self.send_err(code, msg)
@@ -4281,12 +4816,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_bytes(data, mime, 200,
                                extra={"X-Cache": "HIT" if hit else "MISS",
                                       "Vary": "Accept"},
-                               cache="public, max-age=604800")
+                               # share 一律 private,no-store：撤销后 CF 不能继续供图
+                               cache=self.media_cache("public, max-age=604800"))
 
     def serve_raw(self, qs):
+        code, msg = self._media_precheck(qs)
+        if code:
+            return self.send_denied(code, msg)
         lib, rel, fp, code, msg = self._resolve(qs)
         if code:
             return self.send_err(code, msg)
+        cache = self.media_cache("public, max-age=3600")
         rng = self.headers.get("Range")
         total = os.path.getsize(fp)
         ctype = mimetypes.guess_type(fp)[0] or "application/octet-stream"
@@ -4294,14 +4834,18 @@ class Handler(BaseHTTPRequestHandler):
             start, end, kind = parse_range(rng, total)
             if kind in ("invalid", "unsatisfiable"):
                 return self.send_err(400, "bad range")
-            return self._stream_file(fp, start, end, total, ctype, 206)
-        return self._stream_file(fp, 0, total - 1, total, ctype, 200)
+            return self._stream_file(fp, start, end, total, ctype, 206, cache=cache)
+        return self._stream_file(fp, 0, total - 1, total, ctype, 200, cache=cache)
 
     def serve_video(self, qs):
         """MOV/MP4，Range 流式；t=1 时 HEVC→H.264 转码"""
+        code, msg = self._media_precheck(qs)
+        if code:
+            return self.send_denied(code, msg)
         lib, rel, fp, code, msg = self._resolve(qs)
         if code:
             return self.send_err(code, msg)
+        cache = self.media_cache("public, max-age=3600")
         trans = (qs.get("t") or ["0"])[0] == "1"
         extra = {}
         if trans:
@@ -4334,15 +4878,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_err(400, "malformed Range")
         return self._stream_file(fp, start, end, total, ctype,
                                  206 if kind == "ok" else 200,
-                                 tq=(qs.get("q") or [""])[0], extra=extra)
+                                 tq=(qs.get("q") or [""])[0], extra=extra,
+                                 cache=cache)
 
-    def _stream_file(self, fp, start, end, total, ctype, code, tq="", extra=None):
+    def _stream_file(self, fp, start, end, total, ctype, code, tq="", extra=None,
+                     cache=None):
         length = end - start + 1
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Cache-Control", cache or "public, max-age=3600")
         if code == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         for k, v in (extra or {}).items():
@@ -4542,6 +5088,9 @@ def main():
         if TRASH:
             print(f"[回收站] {TRASH.stats()}")
             TRASH.close()
+        if SHARES:
+            print(f"[分享] {SHARES.stats()}")
+            SHARES.close()
         return 0
 
     old_pid, old_port = check_already_running(port)
@@ -4557,6 +5106,8 @@ def main():
     FFMPEG = detect_ffmpeg()
     # 管理口令必须在任何打印之前定好（打印只反映状态，不回显口令本体）
     set_admin_config(token)
+    # 访问控制配置依赖「是否配了口令」，所以必须紧随其后
+    load_access_cfg()
 
     print("=" * 62)
     print("  SeekLive · 时光轴（正式版 Demo）")
@@ -4597,6 +5148,18 @@ def main():
     else:
         print("  源文件管理 : 未配置 → 删除功能关闭（浏览不受影响）")
         print("              如需开启：python server.py --admin-token 你的口令")
+    if ACCESS_PROTECT:
+        print("  访问控制   : 已开启（默认拒绝）")
+        print("              本机 / 局域网 / 公网**同一规则**：需管理授权或分享链接；")
+        print("              分享媒体一律 Cache-Control: private, no-store。")
+        if not ACCESS_CFG.get("shareEnabled"):
+            print("              分享功能：已按配置关闭（access.share.enabled=false）")
+    elif ACCESS_CFG.get("protectRead"):
+        print("  访问控制   : [!] 未生效 —— 未配置管理口令，无人能通过认证。")
+        print("              [!] 当前整个相册对任何能访问到端口的人**完全公开**！")
+        print("              [!] 开启保护：python server.py --admin-token 你的口令")
+    else:
+        print("  访问控制   : 已按配置关闭（access.protectRead=false）→ 相册公开")
     print("=" * 62)
     print("  Ctrl+C 停止，或双击「一键结束.bat」")
     print("  首次索引在后台进行：页面可立即打开，并显示索引进度。")
@@ -4620,6 +5183,8 @@ def main():
             CACHE_INDEX.close()
         if TRASH:
             TRASH.close()
+        if SHARES:
+            SHARES.close()
         clear_pid()
     return 0
 

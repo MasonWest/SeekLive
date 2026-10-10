@@ -14,6 +14,18 @@
     "autoPurge": true
   },
 
+  "access": {
+    "_说明": "访问控制（可选，整段不写即用默认值）。protectRead：只读接口默认拒绝，仅在「已配置管理口令」时生效；配了口令后本机与局域网走相同规则。share：免登录分享相关。",
+    "protectRead": true,
+    "maxItems": 5000,
+    "share": {
+      "enabled": true,
+      "defaultExpireDays": 0,
+      "cookieSecure": "auto",
+      "pepper": ""
+    }
+  },
+
   "libraries": [
     {
       "_说明": "普通照片库：只读浏览。不写 readonly/deletion_enabled 就等同禁止删除。",

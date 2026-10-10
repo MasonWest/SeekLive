@@ -611,3 +611,48 @@ body.selecting .tile{cursor:pointer}
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.01ms!important;transition-duration:.01ms!important}
 }
+
+/* ---------------- 访问控制 / 分享 ---------------- */
+/* 未授权访客（anon）：只有壳，没有任何照片数据 */
+.splash-btn{
+  margin-top:18px;padding:11px 22px;border-radius:12px;font-size:14.5px;font-weight:640;
+  color:#fff;background:var(--grad);box-shadow:0 8px 24px rgba(120,90,255,.32);
+  animation:pop .5s var(--ease) both
+}
+.splash-btn:active{transform:scale(.97)}
+
+/* 分享模式提示条（在 topbar 内） */
+.share-bar{
+  display:flex;align-items:center;gap:8px;
+  margin-top:8px;padding:7px 12px;border-radius:10px;
+  background:linear-gradient(90deg,rgba(124,107,255,.16),rgba(231,92,150,.14));
+  border:1px solid var(--line);
+  font-size:12.5px;color:var(--fg-2);line-height:1.45
+}
+.share-bar .sh-ico{flex:none}
+.share-bar .sh-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 选择条上的「全选本月 / 生成分享」 */
+.sb-month{background:var(--bg-3);color:var(--fg)}
+.sb-month:disabled{opacity:.42}
+.sb-share{background:var(--grad);color:#fff;box-shadow:0 6px 18px rgba(120,90,255,.3)}
+.sb-share:disabled{opacity:.42;box-shadow:none}
+
+/* 分享管理列表 */
+.sh-item{
+  display:flex;flex-direction:column;gap:6px;padding:12px;border-radius:12px;
+  background:var(--bg-3)
+}
+.sh-top{display:flex;align-items:baseline;gap:8px}
+.sh-title{font-size:14.5px;font-weight:660;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.sh-badge{margin-left:auto;flex:none;font-size:11.5px;font-weight:600;padding:2px 8px;
+  border-radius:999px;background:rgba(109,94,252,.16);color:var(--brand)}
+.sh-badge.sh-dead{background:rgba(255,59,48,.14);color:#ff3b30}
+.sh-meta{font-size:12px;color:var(--fg-3);font-variant-numeric:tabular-nums}
+.sh-actions{display:flex;gap:8px;flex-wrap:wrap}
+.sh-link{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;
+  word-break:break-all;padding:8px 10px;border-radius:9px;background:var(--bg-2);
+  border:1px solid var(--line);color:var(--fg-2)
+}

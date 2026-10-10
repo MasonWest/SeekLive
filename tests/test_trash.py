@@ -178,6 +178,16 @@ def main():
     lib = L()
     items0 = lib["count"]
     files0 = len(snap(SRC))
+
+    # 记录**真实** data/trash 的初始状态：本套件跑在独立测试树里，结束时它必须与此刻
+    # **完全一致**。刻意不假设它本来是空的 —— 用户可能真的删过照片（那是可恢复的真实数据）。
+    real_trash = os.path.join(HERE, "data", "trash")
+
+    def _real_trash_listing():
+        return sorted(os.path.relpath(os.path.join(d, f), real_trash)
+                      for d, _s, fs in os.walk(real_trash) for f in fs)
+
+    real_trash_before = _real_trash_listing()
     print(f"[初始] 时间线条目 {items0} 个 / 磁盘文件 {files0} 个 / "
           f"Live {lib['live']} 组 / 配对 {len(S.INDEX.pairs('lib_t'))} 组")
 
@@ -686,12 +696,10 @@ def main():
 
     # ---------- 真实环境隔离 ----------
     print("\n[真实环境隔离]")
-    real_trash = os.path.join(HERE, "data", "trash")
-    real_files = []
-    for d, _s, fs in os.walk(real_trash):
-        real_files += fs
-    chk("真实 data/trash 始终为空（未触碰真实图库）", len(real_files) == 0,
-        f"{len(real_files)} 个文件")
+    real_trash_now = _real_trash_listing()
+    chk("真实 data/trash 未被本套件改动（与开始时逐项一致）",
+        real_trash_now == real_trash_before,
+        f"前 {len(real_trash_before)} 个 / 后 {len(real_trash_now)} 个")
 
     print("\n" + "=" * 70)
     print(f"  结果：{PASS} 通过 / {FAIL} 失败 / {SKIP} 跳过")

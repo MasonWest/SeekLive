@@ -16,6 +16,34 @@ const QS = new URLSearchParams(location.search);
    **不写 localStorage / sessionStorage、不进 URL、不进 <img src>**。 */
 const admin = { required: false, authed: false, expiresAt: 0 };
 
+/* 访问作用域（唯一权威来源 = 服务端 /api/session）：
+     admin = 完整相册 + 管理能力；share = 只读、且仅限被授权的集合；anon = 未授权。
+   ★ 绝不用 URL 上 ?share=1 之类的提示参数当授权凭证 —— 那只是 UI 提示。 */
+const sess = { scope: 'anon', share: null, protectRead: true,
+               adminRequired: false, shareEnabled: true, canManage: false };
+const IS_SHARE = () => sess.scope === 'share';
+function applySession(d) {
+  sess.scope = d.scope || 'anon';
+  sess.share = d.share || null;
+  sess.protectRead = !!d.protectRead;
+  sess.adminRequired = !!d.adminRequired;
+  sess.shareEnabled = d.shareEnabled !== false;
+  sess.canManage = !!d.canManage;
+  if (d.admin) {
+    admin.required = !!d.adminRequired;
+    admin.authed = !!d.admin.authed;
+    admin.expiresAt = d.admin.expiresAt || 0;
+  }
+}
+function fmtExpire(ts) {
+  const days = Math.ceil((ts * 1000 - Date.now()) / 86400000);
+  if (days <= 0) return '即将过期';
+  if (days === 1) return '明天过期';
+  if (days < 30) return `${days} 天后过期`;
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} 过期`;
+}
+
 const IS_IOS = /iP(hone|od|ad)/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
@@ -77,9 +105,20 @@ const enc = encodeURIComponent;
 
 function api(path, params = {}) {
   const q = new URLSearchParams(params).toString();
-  // 浏览类接口一律匿名访问（服务端也不再要求凭证），URL 保持干净。
+  // 浏览类接口：凭证只走 Cookie（同源自动携带），URL 保持干净。
   return fetch(path + (q ? '?' + q : ''), { credentials: 'same-origin' })
-    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+    .then(r => {
+      if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+      return r.json();
+    });
+}
+
+/* 分享链接失效（被撤销 / 过期）→ 退回说明页。判定始终以服务端 401/403 为准。 */
+function shareExpired() {
+  sess.scope = 'anon'; sess.share = null; sess.canManage = false;
+  $('#shareBar').hidden = true;
+  splashAsk('分享链接已失效（可能已被撤销或已过期）。<br>请向分享人索取新的链接。');
+  $('#gateLogin').hidden = true;
 }
 function mediaURL(ep, rel, extra = '') {
   return `${ep}?lib=${enc(state.lib)}&p=${enc(rel)}${extra}`;
@@ -126,16 +165,36 @@ function syncTopbarHeight() {
 async function boot() {
   computeCols();
   syncTopbarHeight();
+
+  // ① 先问服务端「我是谁」——访问作用域的唯一权威来源。
+  //    匿名可读的只有「壳」，页面必须靠这一步才知道自己能看什么。
+  try { applySession(await api('/api/session')); }
+  catch (e) { splashFail('无法连接服务：' + e.message); return; }
+
+  // ② 未授权访客：只给壳 + 入口，**不会**去请求任何相册数据。
+  if (sess.scope === 'anon' && sess.protectRead) {
+    // ?share=1 只是「我是点了分享链接过来的」这一**界面提示**，绝不是授权凭证
+    // （授权一律由服务端 /api/session 判定）。有了它，才能把「链接失效」与
+    // 「普通未授权访客」区分开、给出更准确的提示。
+    if (QS.get('share')) { shareExpired(); return; }
+    splashAsk(sess.shareEnabled
+      ? '这个相册已开启访问保护。<br>请使用收到的分享链接，或输入管理口令。'
+      : '这个相册已开启访问保护。<br>请输入管理口令。');
+    return;
+  }
+
   let d = null;
   try {
     d = await api('/api/libs');
     state.libs = d.libraries || [];
     if (d.trash && d.trash.retentionDays) trashDays = d.trash.retentionDays;
+    // /api/libs 也会带回权威作用域（在分享作用域下顺带拿到分享元信息）
+    if (d.scope) { sess.scope = d.scope; if (d.share) sess.share = d.share; }
   } catch (e) {
-    splashFail('无法连接服务：' + e.message);
+    splashFail('无法读取相册：' + e.message);
     return;
   }
-  try { Object.assign(admin, await api('/api/admin/status')); } catch (e) { /* 浏览不受影响 */ }
+  applyScopeUI();
 
   // 首次索引可能还在后台跑：不空等、不误报「没有照片」，而是显示进度面板。
   if (d && (d.ready === false || d.indexing)) {
@@ -150,6 +209,40 @@ async function boot() {
   }
   buildChips(usable);
   await selectLib(usable[0].id, true);
+}
+
+/* 未授权访客的落地页：复用 splash，附「输入管理口令」入口 */
+function splashAsk(html) {
+  const sub = $('#splashSub');
+  sub.innerHTML = html;
+  sub.style.color = 'var(--fg-2)';
+  const bar = $('.splash-bar');
+  if (bar) bar.style.display = 'none';
+  const g = $('#gateLogin');
+  if (g) g.hidden = !sess.adminRequired;
+}
+
+/* 按作用域调整界面：分享访客隐藏全部管理/破坏性入口。
+   ★ 前端隐藏只是体验 —— 真正的控制始终在服务端（read_guard / media_guard）。 */
+function applyScopeUI() {
+  const m = sess.canManage;
+  for (const sel of ['#btnSelect', '#btnTrash', '#btnIdx', '#btnRefresh',
+                     '#btnGc', '#btnShareManage', '#selMonth', '#selShare']) {
+    const el = $(sel);
+    if (el) el.hidden = !m;
+  }
+  const bar = $('#shareBar');
+  if (IS_SHARE() && sess.share) {
+    const n = (sess.share.count || 0).toLocaleString();
+    $('#shareBarText').textContent = `分享：${sess.share.title} · ${n} 张` +
+      (sess.share.expiresAt ? ` · ${fmtExpire(sess.share.expiresAt)}` : '') +
+      '（只读，不能删除或修改）';
+    bar.hidden = false;
+  } else {
+    bar.hidden = true;
+  }
+  document.body.classList.toggle('share-mode', IS_SHARE());
+  syncTopbarHeight();
 }
 
 function splashFail(msg) {
@@ -201,6 +294,10 @@ async function selectLib(id, isBoot = false, anchor = null) {
     state.tree = await api('/api/tree', { lib: id });
   } catch (e) {
     state.switching = false;
+    if ((e.status === 401 || e.status === 403) && IS_SHARE()) {
+      shareExpired();                      // 分享已撤销/过期 → 明确告知，而不是「加载失败」
+      return;
+    }
     renderEmpty('加载失败', '无法读取索引：' + e.message, true);
     return;
   }
@@ -581,9 +678,10 @@ function openViewer(list, idx) {
   document.body.style.overflow = 'hidden';
   $('#vDetail').hidden = true;
   const meta = libMeta() || {};
-  $('#vDel').hidden = !meta.canManage || !admin.required;   // 能力 + 已配置口令
-  $('#vDel').title = !meta.canManage ? (meta.manageReason || '')
-    : (!admin.required ? '未配置管理口令，删除功能已关闭' : '移入回收站');
+  $('#vDel').hidden = IS_SHARE() || !meta.canManage || !admin.required;  // 分享访客永不可删
+  $('#vDel').title = IS_SHARE() ? '分享访客不能删除照片'
+    : (!meta.canManage ? (meta.manageReason || '')
+      : (!admin.required ? '未配置管理口令，删除功能已关闭' : '移入回收站'));
   showSlide(idx, 0);
 }
 function closeViewer() {
@@ -893,8 +991,9 @@ function openDetail(it) {
     ['类型', it.live ? '实况照片 (Live Photo)'
       : (it.k === 'vid' ? ('视频' + (it.c ? ' · ' + it.c.toUpperCase() : '')) : '图片')],
     ['配对方式', it.live ? (it.pair === 'cid' ? 'Content Identifier 严格匹配' : '同名 + Live 标记') : '—'],
-    ['路径', `<span class="mono">${esc(it.p)}</span>`],
   ];
+  // 分享访客看不到图库内相对路径（属管理信息）
+  if (!IS_SHARE()) rows.push(['路径', `<span class="mono">${esc(it.p)}</span>`]);
   $('#vdList').innerHTML = rows.map(
     ([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   $('#vdList').closest('.vd-card').querySelector('.vd-head').textContent = '详情';
@@ -1099,7 +1198,7 @@ $('#btnRefresh').onclick = async e => {
   btn.disabled = true;
   $('#refreshHint').textContent = '扫描中…';
   try {
-    const r = await api('/api/refresh', { lib: 'all' });
+    const r = await apiGetAdmin('/api/refresh', { lib: 'all' });
     const d = await api('/api/libs');
     state.libs = d.libraries || [];
     buildChips(state.libs.filter(l => l.count > 0));
@@ -1129,7 +1228,7 @@ $('#btnGc').onclick = async e => {
   $('#gcHint').textContent = '计算中…';
   try {
     if (!gcArmed || Date.now() - gcArmed > 10000) {
-      const p = await api('/api/cache/gc');
+      const p = await apiGetAdmin('/api/cache/gc');
       const mb = (p.orphan.bytes / 1048576).toFixed(1);
       if (!p.orphan.files) {
         gcArmed = 0;
@@ -1145,7 +1244,7 @@ $('#btnGc').onclick = async e => {
             `10 秒内再点一次执行清理（不影响源照片）。`, 6500);
       return;
     }
-    const r = await api('/api/cache/gc', { apply: 1 });
+    const r = await apiGetAdmin('/api/cache/gc', { apply: 1 });
     gcArmed = 0;
     $('#gcHint').textContent = '';
     toast(`已清理 ${r.deleted} 个缓存文件，释放 ${(r.bytes / 1048576).toFixed(1)} MB` +
@@ -1167,6 +1266,23 @@ $('#btnDensity').onclick = () => {
 };
 
 $('#btnInfo').onclick = async () => {
+  // 分享访客：统计 / 索引 / 缓存都是 admin-only（服务端会 403），只展示分享自身信息
+  if (IS_SHARE()) {
+    const s = sess.share || {};
+    const lines = [
+      ['正在浏览', `分享相册「${s.title || ''}」`],
+      ['照片数量', (s.count || 0).toLocaleString() + ' 张'],
+      ['所属图库', s.libName || ''],
+      ['有效期', s.expiresAt ? fmtExpire(s.expiresAt) : '长期有效'],
+      ['权限', '只读：不能删除、恢复或修改任何照片'],
+      ['说明', '这是别人分享给你的相册，只能看到被授权的那部分照片。'],
+    ];
+    $('#vdList').innerHTML = lines.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+    $('#vdList').closest('.vd-card').querySelector('.vd-head').textContent = '分享信息';
+    $('#vdAdminBtn').hidden = true;
+    $('#vDetail').hidden = false;
+    return;
+  }
   try {
     const [l, s, ix, ca] = await Promise.all([
       api('/api/libs'), api('/api/stats'), api('/api/index'), api('/api/cache')]);
@@ -1494,6 +1610,39 @@ function libMeta(id) {
   return state.libs.find(l => l.id === (id || state.lib));
 }
 
+/**
+ * 带管理授权的 GET（维护类接口：/api/refresh、/api/cache/gc）。
+ * 服务端已把这两条从匿名白名单移出 —— 它们会写盘/改状态，必须带会话 + X-SL-Admin 头。
+ * 401 → 弹授权框 → 授权成功后自动重试一次（与 apiPost 同一套体验）。
+ */
+async function apiGetAdmin(path, params = {}, _retried) {
+  const q = new URLSearchParams(params).toString();
+  const r = await fetch(path + (q ? '?' + q : ''), {
+    credentials: 'same-origin',
+    headers: { 'X-SL-Admin': '1' }
+  });
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = null; }
+  if (r.status === 401 && data && data.needAuth && !_retried) {
+    if (!admin.required) {
+      const err = new Error('未配置管理口令：该功能已禁用（浏览不受影响）');
+      err.status = 401; err.noAuthConfig = true; throw err;
+    }
+    const pw = await askAdminAuth('该操作需要管理授权。');
+    if (pw === null) { const e2 = new Error('已取消授权'); e2.canceled = true; throw e2; }
+    try { await adminLogin(pw); }
+    catch (e) { throw new Error('授权失败：' + e.message); }
+    return apiGetAdmin(path, params, true);
+  }
+  if (!r.ok) {
+    const msg = (data && (data.error || data.msg)) || ('HTTP ' + r.status);
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+  return data || {};
+}
+
 /* ---------------- 通用二次确认 ---------------- */
 let cfmResolve = null;
 function askConfirm(o) {
@@ -1555,6 +1704,8 @@ function syncSelBar() {
   const n = sel.map.size;
   $('#selCount').textContent = `已选 ${n} 项`;
   $('#selDelete').disabled = n === 0;
+  const sh = $('#selShare');
+  if (sh) sh.disabled = n === 0;
 }
 function toggleSelectMode(on) {
   sel.active = !!on;
@@ -1572,6 +1723,195 @@ $('#btnSelect').onclick = () => {
   toggleSelectMode(!sel.active);
 };
 $('#selCancel').onclick = () => toggleSelectMode(false);
+
+/* =====================================================
+   免登录分享（管理端创建 / 撤销；访客只读）
+   ★ 集合在**创建时固化成快照**：之后相册里新增 / 删除 / 重新索引照片，
+     都不会改变已发出分享的范围（服务端 share_items 保存那一刻的 rel/mov）。
+   ===================================================== */
+
+/* 「全选本月」：把当前正在浏览的那个月一次性全部勾上。
+   月份取自视口顶部那个日期分组（与「保持浏览位置」同一套取法），
+   然后按 600/页 分页把该月拉全 —— 这样「整月分享」不用逐张点。 */
+function currentViewYm() {
+  const anchor = captureViewAnchor();
+  if (anchor && anchor.key) return String(anchor.key).split('|')[0];
+  const last = state.days[state.renderedDayIdx - 1];
+  return (last && last.ym) || '';
+}
+
+$('#selMonth').onclick = async () => {
+  const ym = currentViewYm();
+  if (!ym) { toast('先在时间轴上滚到某个月，再点「全选本月」', 3200); return; }
+  if (!sel.active) toggleSelectMode(true);
+  const btn = $('#selMonth');
+  btn.disabled = true; btn.textContent = '选取中…';
+  try {
+    let off = 0, total = 1;
+    while (off < total) {
+      const d = await api('/api/items', { lib: state.lib, ym, off, lim: 600 });
+      const items = d.items || [];
+      total = d.total || 0;
+      for (const it of items) if (!sel.map.has(it.p)) sel.map.set(it.p, it);
+      off += items.length;
+      if (!items.length) break;
+    }
+    // 已渲染的格子同步高亮（未渲染的部分仍留在选择集里，创建分享时会一并带上）
+    $$('.tile').forEach(a => {
+      const it = tileItemOf(a);
+      a.classList.toggle('sel', !!(it && sel.map.has(it.p)));
+    });
+    syncSelBar();
+    toast(`已选中 ${fmtMonthLabel(ym)}，共 ${sel.map.size} 项`, 3200);
+  } catch (e) {
+    toast('选取本月失败：' + e.message, 4200);
+  } finally {
+    btn.disabled = false; btn.textContent = '全选本月';
+  }
+};
+
+/* 生成分享链接 */
+$('#selShare').onclick = async () => {
+  if (!sel.map.size) return;
+  const rels = [...sel.map.values()].map(x => x.p);
+  const defTitle = (libMeta() ? libMeta().name : '相册') + ' 分享';
+  const ok = await askConfirm({
+    title: '生成分享链接',
+    okText: '生成链接',
+    html: `<div class="cfm-warn">把当前选中的 <b>${rels.length}</b> 张照片生成一个
+             <b>只读</b>分享链接。拿到链接的人无需登录即可查看这些照片
+             （不能删除、恢复或修改）。</div>
+           <label class="aa-lab">分享标题<input id="shTitle" type="text" maxlength="40"
+             value="${esc(defTitle)}" placeholder="例如：九月精选"></label>
+           <label class="aa-lab">有效期
+             <select id="shDays">
+               <option value="0">长期有效</option>
+               <option value="7">7 天</option>
+               <option value="30" selected>30 天</option>
+               <option value="90">90 天</option>
+             </select></label>
+           <div class="aa-hint">分享内容在创建的这一刻就固化了：之后你在相册里新增或删除照片，
+             都不会改变这条分享的范围。</div>`,
+  });
+  if (!ok) return;
+  const title = (($('#shTitle') || {}).value || '').trim();
+  const days = parseInt((($('#shDays') || {}).value || '0'), 10) || 0;
+  try {
+    const r = await apiPost('/api/share/create',
+      { lib: state.lib, rels, title, expireDays: days, kind: 'items' });
+    toggleSelectMode(false);
+    showShareResult(location.origin + r.url, r.share, r.skipped);
+  } catch (e) {
+    toast('生成分享失败：' + e.message, 4600);
+  }
+};
+
+function showShareResult(url, meta, skipped) {
+  const skip = (skipped && skipped.length)
+    ? `<div class="aa-hint">有 ${skipped.length} 张不在索引里，已自动跳过。</div>` : '';
+  askConfirm({
+    title: '分享链接已生成',
+    okText: '完成',
+    html: `<div class="cfm-warn"><b>${esc((meta && meta.title) || '分享')}</b> ·
+             ${(meta && meta.count) || 0} 张 ·
+             ${meta && meta.expiresAt ? esc(fmtExpire(meta.expiresAt)) : '长期有效'}</div>
+           <div class="sh-link" id="shUrl">${esc(url)}</div>
+           <button class="cfm-btn" id="shCopy" style="margin-top:10px">复制链接</button>
+           <div class="aa-hint">把这条链接发给对方即可（对方无需登录）。
+             随时可在「分享管理」里撤销，撤销后立即失效。${skip}</div>`,
+  });
+  const b = $('#shCopy');
+  if (b) b.onclick = async () => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(url);
+        toast('链接已复制', 2200);
+      } else {
+        const el = $('#shUrl');
+        const r = document.createRange(); r.selectNodeContents(el);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        toast('已选中链接，请手动复制', 3000);
+      }
+    } catch (e) { toast('复制失败，请长按链接手动复制', 3000); }
+  };
+}
+
+/* ---------------- 分享管理（列出 / 撤销） ---------------- */
+async function openShareSheet() {
+  if (state.search.active) exitSearch();
+  if (sel.active) toggleSelectMode(false);
+  $('#shareSheet').hidden = false;
+  await loadShares();
+}
+
+async function loadShares() {
+  const box = $('#shareList');
+  box.innerHTML = '<div class="t-empty">读取中…</div>';
+  let d;
+  try { d = await apiPost('/api/share/list', { lib: state.lib }); }
+  catch (e) {
+    box.innerHTML = `<div class="t-empty">读取失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const list = d.shares || [];
+  $('#shareHint').textContent = `${list.length} 条有效分享`;
+  const note = $('#shareNote');
+  note.hidden = !!d.enabled;
+  if (!d.enabled) {
+    note.textContent = '分享功能已在服务端配置中关闭'
+      + '（libraries.json → access.share.enabled = false）。';
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="t-empty">还没有分享。<br>退出后勾选照片，点「生成分享」即可创建。</div>';
+    return;
+  }
+  box.innerHTML = list.map(s => `
+    <div class="sh-item" data-id="${esc(s.id)}">
+      <div class="sh-top">
+        <span class="sh-title">${esc(s.title || '未命名分享')}</span>
+        <span class="sh-badge">${s.count} 张</span>
+      </div>
+      <div class="sh-meta">${esc(s.libName || '')} ·
+        ${s.expiresAt ? esc(fmtExpire(s.expiresAt)) : '长期有效'} ·
+        创建于 ${esc(fmtAgo(s.createdAt))}</div>
+      <div class="sh-actions">
+        <button class="t-mini t-danger sh-revoke">撤销分享</button>
+      </div>
+    </div>`).join('');
+  $$('.sh-revoke', box).forEach(btn => {
+    btn.onclick = async () => {
+      const item = btn.closest('.sh-item');
+      const title = item.querySelector('.sh-title').textContent;
+      const ok = await askConfirm({
+        title: '撤销这条分享？',
+        okText: '撤销', danger: true,
+        html: `<div class="cfm-warn">撤销后，对方手里的链接与浏览器里的 Cookie
+                 <b>立即失效</b>（浏览与图片请求都会被拒绝）。<br>不会删除任何照片。</div>
+               <div class="sh-meta">${esc(title)}</div>`,
+      });
+      if (!ok) return;
+      try {
+        await apiPost('/api/share/revoke', { id: item.dataset.id });
+        toast('已撤销，链接立即失效', 3000);
+        await loadShares();
+      } catch (e) { toast('撤销失败：' + e.message, 3800); }
+    };
+  });
+}
+
+$('#btnShareManage').onclick = () => { $('#sheet').hidden = true; openShareSheet(); };
+$('#btnShareReload').onclick = () => loadShares();
+$('#btnShareClose').onclick = () => { $('#shareSheet').hidden = true; };
+
+/* 未授权访客（anon）的登录入口 */
+$('#gateLogin').onclick = async () => {
+  const pw = await askAdminAuth('输入管理口令以查看完整相册。');
+  if (pw === null) return;
+  try { await adminLogin(pw); }
+  catch (e) { toast('授权失败：' + e.message, 4200); return; }
+  toast('授权成功，正在载入…', 1800);
+  setTimeout(() => location.reload(), 260);
+};
 
 /* ---------------- 保持浏览位置（删除/恢复后）----------------
    ★ 时间轴是「滚到哪渲染到哪」的懒加载（renderNextBatch 一批 20 个日期分组）。

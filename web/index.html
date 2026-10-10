@@ -33,6 +33,8 @@
   <div class="splash-title">时光轴</div>
   <div class="splash-sub" id="splashSub">正在建立索引…</div>
   <div class="splash-bar"><i></i></div>
+  <!-- 未授权访客（anon）：壳能匿名拿到，但看不到任何照片数据，这里给一个入口 -->
+  <button class="splash-btn" id="gateLogin" hidden>输入管理口令</button>
 </div>
 
 <!-- ── 顶栏 ───────────────────────────────────────── -->
@@ -75,6 +77,12 @@
     <input id="searchInput" type="search" placeholder="搜索文件名…" autocomplete="off"
            autocorrect="off" autocapitalize="off" spellcheck="false">
     <button class="s-cancel" id="searchCancel">完成</button>
+  </div>
+
+  <!-- ── 分享模式提示条（只读访客；放在 topbar 内 → 高度自动纳入 --topbar-h） ── -->
+  <div class="share-bar" id="shareBar" hidden>
+    <span class="sh-ico">🔗</span>
+    <span class="sh-text" id="shareBarText"></span>
   </div>
 </header>
 
@@ -176,6 +184,7 @@
       <button class="sf-btn sf-warn" id="btnGc">
         🧹 孤儿缓存清理<span class="sf-n" id="gcHint"></span>
       </button>
+      <button class="sf-btn" id="btnShareManage">🔗 分享管理</button>
     </div>
   </div>
 </div>
@@ -241,8 +250,28 @@
 <!-- ── 选择模式操作条 ─────────────────────────────── -->
 <div id="selBar" class="sel-bar" hidden>
   <button class="sb-cancel" id="selCancel">取消</button>
+  <button class="sb-month" id="selMonth" hidden>全选本月</button>
   <span class="sb-count" id="selCount">已选 0 项</span>
+  <button class="sb-share" id="selShare" hidden disabled>生成分享</button>
   <button class="sb-del" id="selDelete" disabled>移入回收站</button>
+</div>
+
+<!-- ── 分享管理（管理端：列出 / 撤销） ───────────────── -->
+<div id="shareSheet" class="sheet" hidden>
+  <div class="sheet-bg" data-close></div>
+  <div class="sheet-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head t-hd">
+      <span>🔗 分享管理</span>
+      <span class="t-right" id="shareHint"></span>
+    </div>
+    <div class="t-note" id="shareNote" hidden></div>
+    <div class="sheet-scroll t-list" id="shareList"></div>
+    <div class="sheet-foot">
+      <button class="sf-btn" id="btnShareReload">↻ 刷新</button>
+      <button class="sf-btn" id="btnShareClose">关闭</button>
+    </div>
+  </div>
 </div>
 
 <!-- ── 二次确认 ────────────────────────────────────── -->

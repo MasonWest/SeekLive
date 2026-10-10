@@ -8,8 +8,8 @@ SeekLive · 管理认证独立化 —— 正反两面测试
 
   A. 状态机闭环：无口令 / 错误口令 / 正确登录 / 会话有效 / 会话过期 /
                  退出失效 / 管理操作成功
-  B. 匿名边界：静态资源、照片、视频、Live Photo、普通浏览 API
-               在**无管理会话**时全部可匿名访问
+  B. 访问边界：**无口令**时静态资源 / 照片 / 视频 / Live Photo / 浏览 API 全部匿名可读；
+               **配了口令**时默认拒绝 —— 静态外壳仍匿名，数据与媒体一律要身份（v1.1）
   C. 拒绝边界：未授权的 删除 / 恢复 / 永久删除 / 清空回收站
                全部被**服务端**拒绝（不是前端置灰）
   D. 安全细节：Cookie 属性、来源校验、CSRF、登录失败退避、日志脱敏
@@ -18,6 +18,8 @@ SeekLive · 管理认证独立化 —— 正反两面测试
 运行：  python tests/test_admin_auth.py
 说明：  本套件会**先停止**当前正在运行的服务实例（PID 文件守卫只允许单实例），
        并在结束后停掉自己启动的实例。全程只读浏览 + dry=1 预览，不动任何真实文件。
+       少数用例依赖环境里的 libraries.json（≥2 个库、含只读库 wework）；
+       未提供时**明确跳过**，不误报失败。
 """
 
 import http.cookiejar
@@ -55,6 +57,11 @@ def chk(name, ok, extra=""):
 
 def sect(t):
     print(f"\n=== {t} ===")
+
+
+def skip(name, why=""):
+    """环境未提供所需素材时**明确跳过**（不静默通过，也不误报失败）。"""
+    print(f"  ⏭ 跳过 {name}" + (f"  [{why}]" if why else ""))
 
 
 # ---------------------------------------------------------
@@ -114,6 +121,33 @@ class Srv:
         subprocess.run([PY, "server.py", "--stop"], cwd=APP,
                        capture_output=True, timeout=30)
         time.sleep(1.2)
+        self._kill_port_squatter()
+
+    def _listener_pid(self):
+        """返回**本实例端口**上正在 LISTEN 的进程 pid（没有则 None）。"""
+        try:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                                 timeout=15).stdout.decode("utf-8", "ignore")
+        except Exception:
+            return None
+        needle = f":{self.port} "
+        for line in out.splitlines():
+            if "LISTENING" in line and needle in line:
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    return int(parts[-1])
+        return None
+
+    def _kill_port_squatter(self):
+        """★ 兜底清理：PID 文件是**全局唯一**的，一旦被覆盖或丢失（上一次运行被
+        Ctrl+C / 超时打断就会这样），`--stop` 就找不到它，端口上会留一个孤儿实例。
+        之后新实例会因为「服务已在运行」而启动失败，表现为莫名其妙的启动失败 / 401。
+        这里按**本实例自己的端口**精确清掉孤儿 —— 只动测试用的 905x 端口。"""
+        pid = self._listener_pid()
+        if pid:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, timeout=15)
+            time.sleep(0.8)
 
     def start(self):
         self._stop_running()
@@ -140,11 +174,14 @@ class Srv:
             time.sleep(0.4)
         else:
             return False, self.banner()
-        # 端口先于索引就绪：必须等启动索引真正跑完，断言才有确定性
+        # 端口先于索引就绪：必须等启动索引真正跑完，断言才有确定性。
+        # ★ v1.1 默认拒绝之后，配了口令的实例**匿名取不到 /api/libs**（401），
+        #   所以就绪探针必须先登录再问 —— 否则每个实例都要空等 90 秒并误报「启动失败」。
+        probe = self._probe_opener()
         deadline = time.time() + 90
         while time.time() < deadline:
             try:
-                st, _, raw = request(self.base + "/api/libs", timeout=5)
+                st, _, raw = request(self.base + "/api/libs", timeout=5, opener=probe)
                 d = jbody(raw)
                 if st == 200 and d.get("ready") is True and not d.get("indexing"):
                     return True, self.banner()
@@ -152,6 +189,28 @@ class Srv:
                 pass
             time.sleep(0.4)
         return False, self.banner()
+
+    def _configured_token(self):
+        """本实例是否配了管理口令；配了就把值取出来（供就绪探针登录用）。"""
+        for i, a in enumerate(self.extra_args):
+            if a in ("--admin-token", "--token") and i + 1 < len(self.extra_args):
+                return self.extra_args[i + 1]
+        if self.admin_json:
+            return (self.admin_json or {}).get("adminToken") or None
+        return None
+
+    def _probe_opener(self):
+        """就绪探针用的 opener：配了口令 → 先登录拿会话；没配 → 匿名。"""
+        tok = self._configured_token()
+        if not tok:
+            return anonymous()
+        op, _ = new_session()
+        try:
+            request(self.base + "/api/admin/login", "POST", {"token": tok},
+                    {"X-SL-Admin": "1"}, op, timeout=5)
+        except Exception:
+            pass
+        return op
 
     def banner(self):
         try:
@@ -215,7 +274,9 @@ def main():
         # 匿名浏览：普通 API
         st, _, raw = request(s.base + "/api/libs")
         libs = jbody(raw).get("libraries") or []
-        chk("无口令 · 匿名 /api/libs → 200", st == 200 and len(libs) >= 2,
+        if len(libs) < 2:
+            skip("图库数量 ≥ 2", f"本机 libraries.json 只配了 {len(libs)} 个库")
+        chk("无口令 · 匿名 /api/libs → 200", st == 200 and len(libs) >= 1,
             f"HTTP {st} libs={len(libs)}")
 
         lib_ids = [l["id"] for l in libs]
@@ -274,7 +335,7 @@ def main():
         chk("无口令 · 登录接口 → 403（未配置）", st == 403, f"HTTP {st}")
 
         # ---------------------------------------------------------
-        sect("组 2 · 有口令：浏览仍匿名、管理需授权")
+        sect("组 2 · 有口令：默认拒绝（静态外壳匿名、数据/媒体要身份）、管理需授权")
         # ---------------------------------------------------------
         s2 = Srv(9051, ["--admin-token", pw])
         ok, banner = s2.start()
@@ -289,26 +350,49 @@ def main():
             "源文件管理 : 已启用" in banner, "banner")
         chk("启动输出不含口令明文（脱敏）", pw not in banner, "banner")
 
-        # 浏览路径依然全部匿名
+        # ★ v1.1 默认拒绝：配了口令后，**静态外壳仍匿名，数据与媒体一律要身份**。
+        #   （这正是相对旧版"浏览公开"的核心变化，单独断言。）
         anon = anonymous()
-        browse_ok = True
-        detail = []
-        for p in ("/", "/app.css", "/app.js", f"/api/libs",
-                  f"/api/tree?lib={img_lib}", f"/api/items?lib={img_lib}&lim=1"):
+        detail, static_ok = [], True
+        for p in ("/", "/app.css", "/app.js"):
+            st, _, _ = request(s2.base + p, opener=anon)
+            detail.append(f"{p}:{st}")
+            static_ok = static_ok and st == 200
+        chk("有口令 · 匿名静态外壳仍 200（前端要能自判身份）", static_ok, " ".join(detail))
+
+        detail, api_denied = [], True
+        for p in ("/api/libs", f"/api/tree?lib={img_lib}",
+                  f"/api/items?lib={img_lib}&lim=1"):
             st, _, _ = request(s2.base + p, opener=anon)
             detail.append(f"{p.split('?')[0]}:{st}")
-            browse_ok = browse_ok and st == 200
-        chk("有口令 · 匿名浏览 API / 静态资源全部 200", browse_ok, " ".join(detail))
+            api_denied = api_denied and st == 401
+        chk("有口令 · 匿名浏览 API → 401（默认拒绝）", api_denied, " ".join(detail))
 
-        for label, url, hdrs in (
-                ("/thumb", f"/thumb?lib={img_lib}&p=" + urllib.parse.quote(img_rel) + "&s=160", {}),
-                ("/photo", f"/photo?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
-                ("/raw", f"/raw?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
-                ("/video", f"/video?lib={vid_lib}&p=" + urllib.parse.quote(vid_rel),
-                 {"Range": "bytes=0-1023"})):
+        media_probes = (
+            ("/thumb", f"/thumb?lib={img_lib}&p=" + urllib.parse.quote(img_rel) + "&s=160", {}),
+            ("/photo", f"/photo?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
+            ("/raw", f"/raw?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
+            ("/video", f"/video?lib={vid_lib}&p=" + urllib.parse.quote(vid_rel),
+             {"Range": "bytes=0-1023"}),
+        )
+        for label, url, hdrs in media_probes:
             st, _, _ = request(s2.base + url, headers=hdrs, opener=anon)
-            chk(f"有口令 · 匿名 {label} → 200/206（不要求登录）",
-                st in (200, 206), f"HTTP {st}")
+            chk(f"有口令 · 匿名 {label} → 401（默认拒绝）", st == 401, f"HTTP {st}")
+
+        # 授权之后：同样这些路径必须全部可用 —— 证明拒绝的是"未授权"而非"功能坏了"
+        sess, _cj = new_session()
+        request(s2.base + "/api/admin/login", "POST", {"token": pw},
+                {"X-SL-Admin": "1"}, sess)
+        detail, api_ok = [], True
+        for p in ("/api/libs", f"/api/tree?lib={img_lib}",
+                  f"/api/items?lib={img_lib}&lim=1"):
+            st, _, _ = request(s2.base + p, opener=sess)
+            detail.append(f"{p.split('?')[0]}:{st}")
+            api_ok = api_ok and st == 200
+        chk("有口令 · 授权后浏览 API 全部 200", api_ok, " ".join(detail))
+        for label, url, hdrs in media_probes:
+            st, _, _ = request(s2.base + url, headers=hdrs, opener=sess)
+            chk(f"有口令 · 授权后 {label} → 200/206", st in (200, 206), f"HTTP {st}")
 
         # 未授权（无会话）→ 401 + needAuth
         for name, path, payload in (
@@ -366,11 +450,14 @@ def main():
             st not in (401, 403), f"HTTP {st}")
 
         # 只读库：口令不能改变 readonly
-        st, _, raw = request(s2.base + "/api/delete", "POST",
-                             {"lib": "wework", "items": ["x"], "dry": 1},
-                             {"X-SL-Admin": "1"}, op)
-        chk("会话有效 · 只读库 wework → 403（口令不改 readonly）",
-            st == 403, f"HTTP {st} {jbody(raw).get('error','')}")
+        if "wework" in lib_ids:
+            st, _, raw = request(s2.base + "/api/delete", "POST",
+                                 {"lib": "wework", "items": ["x"], "dry": 1},
+                                 {"X-SL-Admin": "1"}, op)
+            chk("会话有效 · 只读库 wework → 403（口令不改 readonly）",
+                st == 403, f"HTTP {st} {jbody(raw).get('error','')}")
+        else:
+            skip("会话有效 · 只读库 wework → 403", "本机 libraries.json 未配置 id=wework 的库")
 
         # CSRF / 来源校验
         st, _, raw = request(s2.base + "/api/delete", "POST",
@@ -494,9 +581,9 @@ def main():
                            {"X-SL-Admin": "1"})
         chk("--token 别名的值可登录 → 200", st == 200, f"HTTP {st}")
 
-        # 三个实例都提供 /api/libs，且浏览免登录
+        # 别名与 --admin-token 语义完全相同：配了口令 → 匿名浏览一律 401
         st, _, _ = request(s7.base + "/api/libs", opener=anonymous())
-        chk("--token 别名下浏览仍匿名 → 200", st == 200, f"HTTP {st}")
+        chk("--token 别名下匿名浏览 → 401（与 --admin-token 同语义）", st == 401, f"HTTP {st}")
 
         # ---------------------------------------------------------
         sect("组 7 · 日志脱敏")
