@@ -228,6 +228,14 @@ main{padding-bottom:calc(var(--safe-b) + 90px)}
 .tile img{width:100%;height:100%;object-fit:cover;
   opacity:0;transition:opacity .38s var(--ease);}
 .tile.loaded img{opacity:1}
+
+/* 缩略图彻底取不到时的占位（明确图标，而不是空白格/问号） */
+.tile-ph{position:absolute;inset:0;display:grid;place-items:center;
+  background:var(--bg-3);color:var(--fg-3)}
+.tile-ph svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:1.7;
+  stroke-linejoin:round}
+.tile-ph.vid{background:linear-gradient(135deg,#3a3f4b,#22252c);color:rgba(255,255,255,.75)}
+.tile-ph.vid svg{width:34px;height:34px;fill:currentColor;stroke:none;opacity:.9}
 .tile:active{transform:scale(.975)}
 
 .tile .badge{

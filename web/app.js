@@ -84,7 +84,17 @@ function api(path, params = {}) {
 function mediaURL(ep, rel, extra = '') {
   return `${ep}?lib=${enc(state.lib)}&p=${enc(rel)}${extra}`;
 }
+/* 尺寸档 srcset。
+   网络自适应：若本会话内刚观察到「缩略图普遍取不到」，60 秒内降级为单档请求，
+   避免 srcset 把一次失败放大成 N 次（弱网 / 服务端临时故障时更稳）；到期自动恢复。 */
+function thumbLite() {
+  try {
+    const t = +sessionStorage.getItem('thumbLiteAt') || 0;
+    return t > 0 && (Date.now() - t) < 60000;
+  } catch (e) { return false; }
+}
 function thumbSrcset(rel) {
+  if (thumbLite()) return mediaURL('/thumb', rel, '&s=640');
   return THUMB_VARIANTS
     .map(s => `${mediaURL('/thumb', rel, '&s=' + s)} ${s}w`).join(', ');
 }
@@ -358,13 +368,38 @@ function paintGrid(grid, items, ctxKey) {
       `srcset="${thumbSrcset(it.p)}" sizes="${sizes}">`;
     const img = a.querySelector('img');
     img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
-    img.addEventListener('error', () => {
-      a.classList.add('loaded');
-      a.style.background = 'var(--bg-3)';
-    }, { once: true });
+    // ★ 不能用 once：重试后的「第二次失败」仍需接管，否则格子会变成纯空白。
+    img.addEventListener('error', () => fallbackThumb(img, a, it, 320));
     frag.appendChild(a);
   });
   grid.appendChild(frag);
+}
+
+/* 缩略图加载失败：先静默重试一次（服务端偶发抽帧失败 / 缓存竞态），
+   仍失败才落成明确占位（视频给播放图标），绝不留「空白格 / 问号」。 */
+let thumbFailStreak = 0;
+function fallbackThumb(img, tile, it, side) {
+  if (!img.isConnected) return;              // 已被替换 → 不再处理
+  thumbFailStreak++;
+  if (thumbFailStreak >= 6) {                // 连续失败 → 本会话 60s 内降级单档
+    try { sessionStorage.setItem('thumbLiteAt', String(Date.now())); } catch (e) {}
+  }
+  if (img.dataset.retried !== '1') {
+    img.dataset.retried = '1';
+    img.removeAttribute('srcset');
+    img.sizes = '';
+    img.src = mediaURL('/thumb', it.p, `&s=${side}&r=${Date.now()}`);
+    return;
+  }
+  tile.classList.add('loaded');
+  tile.style.background = 'var(--bg-3)';
+  const ph = document.createElement('span');
+  ph.className = 'tile-ph' + (it.k === 'vid' ? ' vid' : '');
+  ph.innerHTML = it.k === 'vid'
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.5l9 5.5-9 5.5z"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"/>' +
+      '<path d="M4 15l4-4 3 3 3-3 6 6"/></svg>';
+  img.replaceWith(ph);
 }
 
 /* 竖长图（截图 / 文档）用 contain 完整展示；横向照片用 cover 铺满 */
@@ -471,6 +506,7 @@ function paintSearch(grid, items, baseIdx) {
       `srcset="${thumbSrcset(it.p)}" sizes="${sizes}">`;
     const img = a.querySelector('img');
     img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
+    img.addEventListener('error', () => fallbackThumb(img, a, it, 320));
     frag.appendChild(a);
   });
   grid.appendChild(frag);

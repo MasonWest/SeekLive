@@ -93,7 +93,9 @@ CONFIG_PATH = os.path.join(APP_DIR, "libraries.json")
 for _d in (CACHE_DIR, TMP_DIR, LOG_DIR, DATA_DIR, TRASH_DIR, WEB_DIR):
     os.makedirs(_d, exist_ok=True)
 
-CACHE_VERSION = "v4"          # 处理算法/缓存键变更时 +1 → 旧缓存自然失效
+CACHE_VERSION = "v6"          # 处理算法/缓存键变更时 +1 → 旧缓存自然失效
+                              # v4→v6：视频封面改为「多时间点候选 + 打分择优」，
+                              #        旧的黑色封面缓存（取 0.5s 黑场）随此自动作废重抽
 CODEC_PROBE_VERSION = 2       # 码流探测算法变更时 +1 → 已缓存的 codec 重新探测
 
 THUMB_DEFAULT = 320
@@ -103,6 +105,16 @@ PHOTO_MAX = 2048
 PHOTO_QUALITY = 84
 VIDEO_CHUNK = 256 * 1024
 MAX_TRANSCODE_MB = 512        # 超过此体积不做「整文件转码」（避免首字节等几分钟）
+
+# ---------- 视频封面抽帧 ----------
+# 固定取 0.5s 会踩到「开场黑场」（实测部分培训视频 0~1s 全黑，抽出来整图 RGB≈2），
+# 深色界面下就是一个空格子。改为多时间点候选 + 画面质量打分择优。
+VIDEO_FRAME_CANDIDATES = (0.5, 1.0, 3.0, 6.0, 12.0, 20.0, 0.0)  # 秒
+# 末位 0.0 = 最后兜底（短于 0.5s 的视频只能取首帧）
+VIDEO_FRAME_MIN_LUMA = 12      # 平均亮度低于此值视为「近黑」（开场黑场）
+VIDEO_FRAME_MAX_LUMA = 250     # 高于此值视为「纯白过曝」（白底课件 245 属正常，不拒）
+VIDEO_FRAME_MIN_STDDEV = 4.0   # 对比度低于此值视为「纯色块」，无信息量
+VIDEO_FRAME_DARK_STDDEV = 12.0 # 近黑时仍需的最低对比度（黑底白字仍算有内容）
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
            ".heic", ".heif", ".tif", ".tiff", ".avif"}
@@ -2345,34 +2357,91 @@ def pick_thumb(req):
     return min(THUMB_ALLOWED, key=lambda x: abs(x - s))
 
 
+def _grab_frame_raw(path, seek, timeout=35):
+    """在 seek 秒处抽一帧原始 JPEG 字节；失败返回 None。"""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    if seek:
+        cmd += ["-ss", str(seek)]
+    cmd += ["-i", path, "-frames:v", "1",
+            "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
+        return None
+    if r.returncode == 0 and r.stdout:
+        return r.stdout
+    return None
+
+
+def _frame_score(im):
+    """
+    给一帧画面打分：越高越「像一张有信息量的封面」。
+
+    不可用 = 纯色块（黑场 / 白屏 / 单色卡）：
+      · 平均亮度落在 [MIN_LUMA, MAX_LUMA] 且对比度 ≥ MIN_STDDEV → 可用
+      · 亮度低于 MIN_LUMA 时，除非对比度足够高（黑底白字的字幕卡），否则判为黑场
+    白底 PPT 课件（亮度 ~245、对比度 30+）是有内容的正常封面，不得误杀。
+    """
+    from PIL import ImageStat
+    s = ImageStat.Stat(im)
+    luma = sum(s.mean[:3]) / 3.0
+    stddev = sum(s.stddev[:3]) / 3.0
+    if luma < VIDEO_FRAME_MIN_LUMA:
+        if stddev < VIDEO_FRAME_DARK_STDDEV:      # 近黑且几乎纯色 → 黑场
+            return None
+    elif luma > VIDEO_FRAME_MAX_LUMA and stddev < VIDEO_FRAME_MIN_STDDEV:
+        return None                               # 纯白且无对比度 → 白屏
+    elif stddev < VIDEO_FRAME_MIN_STDDEV:
+        return None                               # 中间调的纯色块 → 无信息量
+    # 对比度越高越好；亮度向中灰靠拢略有加成
+    mid_bonus = -abs(luma - 128.0) / 256.0
+    return stddev + mid_bonus
+
+
 def gen_video_frame(path, max_side, quality=THUMB_QUALITY, fmt="webp"):
     """
     用 ffmpeg 抽一帧（独立视频的缩略图 / 高清静帧）。
-    先试 0.5s 处（避开开头的黑场/抖动），失败再退回第一帧。
+
+    选帧策略：按 VIDEO_FRAME_CANDIDATES 顺序逐点抽帧并打分，取「有画面」的那一帧；
+    命中第一个合格帧即停（多数视频 0.5s 就合格，不额外付代价）。全部不合格时
+    （例如开场长时间黑底字幕），取最不差的候选帧兜底——保证永远能出图。
     """
     if not FFMPEG:
         raise RuntimeError("未找到 ffmpeg，无法为视频生成画面")
     from PIL import Image
-    frame = None
-    for seek in ("0.5", "0"):
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
-        if seek != "0":
-            cmd += ["-ss", seek]
-        cmd += ["-i", path, "-frames:v", "1"]
-        if max_side:
-            cmd += ["-vf", f"scale='min({max_side},iw)':-2"]
-        cmd += ["-f", "image2pipe", "-vcodec", "mjpeg", "-"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=60)
-        except subprocess.TimeoutExpired:
+
+    best = None          # (score, jpeg_bytes)
+    fallback = None      # (luma_distance, jpeg_bytes) 兜底
+    for seek in VIDEO_FRAME_CANDIDATES:
+        raw = _grab_frame_raw(path, seek)
+        if not raw:
             continue
-        if r.returncode == 0 and r.stdout:
-            frame = r.stdout
-            break
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+        except Exception:
+            continue
+        if fallback is None:
+            from PIL import ImageStat
+            st = ImageStat.Stat(im)
+            luma = sum(st.mean[:3]) / 3.0
+            fallback = (abs(luma - 128.0), raw)
+        score = _frame_score(im)
+        if score is not None:
+            best = (score, raw)
+            break                    # 首个合格帧即定稿，避免做无用功
+    if best is None:
+        best = (0.0, fallback[1]) if fallback else (0.0, None)
+    frame = best[1]
     if not frame:
         raise RuntimeError("视频抽帧失败")
+
     im = Image.open(io.BytesIO(frame))
     im.load()
+    if max_side and (im.width > max_side or im.height > max_side):
+        im.thumbnail((max_side, max_side), Image.LANCZOS)
     buf = io.BytesIO()
     if fmt == "jpeg":
         if im.mode != "RGB":
@@ -2501,6 +2570,73 @@ def build_transcode(src, lib_id="", rel=""):
         except OSError:
             pass
         return None, False
+
+
+# ---------- 视频封面预热 ----------
+_WARM_MAX = 240                 # 单库预热上限（避免超大视频库拖长启动占用）
+_WARM_BUDGET_SEC = 300          # 预热总时间预算：超时即收工，绝不影响正常服务
+# 必须与 web/app.js 的 THUMB_VARIANTS 对齐 —— 前端 srcset 只会请求这几档，
+# 预热别的档位等于白做（浏览器选不中，仍旧现抽）。
+_WARM_THUMB_SIDES = (160, 320, 480, 640)
+_warm_started = threading.Event()
+
+
+def warm_video_thumbnails(max_per_lib=_WARM_MAX, budget_sec=_WARM_BUDGET_SEC):
+    """
+    后台低优先级预热「独立视频」的封面，消除 iOS 上「滚到才抽帧」的空白格。
+
+    为什么需要：视频封面只能靠 ffmpeg 现抽（文件 26MB~1.2GB 不等），首次访问前
+    没有任何缓存，用户在格子上先看到的是灰底骨架 —— 观感等同于「没有封面」。
+    预热复用同一套磁盘缓存与并发闸门（_gen_sem），已缓存的直接跳过，
+    因此代价只有一次磁盘探测；未缓存的按 _GEN_WORKERS 限流后台生成。
+    带总时间预算：到点就收工，剩余封面仍由「按需抽帧」兜住。
+    """
+    if _warm_started.is_set():
+        return 0
+    _warm_started.set()
+    if not FFMPEG or INDEX is None:
+        return 0
+    t0 = time.time()
+    made = skipped = 0
+    for lid in META["lib_order"]:
+        if time.time() - t0 > budget_sec:
+            log.info("封面预热达到时间预算（%ds），提前收工", budget_sec)
+            break
+        lib = META["libs"].get(lid)
+        if not lib or not lib.get("exists", True) or lib.get("stale"):
+            continue
+        vids = [it for it in (lib.get("items") or []) if it.get("k") == "vid"]
+        if not vids:
+            continue
+        log.info("封面预热开始：%s 共 %d 个独立视频", lib.get("name", lid), len(vids))
+        for it in vids[:max_per_lib]:
+            if time.time() - t0 > budget_sec:
+                break
+            rel = it["p"]
+            try:
+                fp = safe_resolve(lib["root"], rel)
+                st = os.stat(fp)
+            except Exception as e:
+                log.warning("封面预热跳过 %s: %s", rel, e)
+                continue
+            for side in _WARM_THUMB_SIDES:
+                h = cache_key(rel, st.st_mtime, st.st_size,
+                              "thumbwebp" + str(side), "", lib_id=lid)[2]
+                if os.path.isfile(cache_path(h[:2], h[2:4], h)):
+                    skipped += 1
+                    continue
+                try:
+                    cached_image(lib, rel, fp, st, "thumb", side,
+                                 THUMB_QUALITY, "webp")
+                    made += 1
+                except Exception as e:
+                    log.warning("封面预热失败 %s(s=%s): %s", rel, side, e)
+    log.info("封面预热完成：新生成 %d 张 / 命中已有 %d 张 / 耗时 %.1fs",
+             made, skipped, time.time() - t0)
+    if made:
+        print(f"[预热] 独立视频封面已预生成 {made} 张"
+              f"（耗时 {time.time() - t0:.1f}s，后台完成）")
+    return made
 
 
 # =========================================================
@@ -4014,6 +4150,9 @@ def _bootstrap_async(rc, pt):
         threading.Thread(target=recheck_loop, name="recheck", daemon=True).start()
     if TRASH and pt > 0:
         threading.Thread(target=purge_loop, name="purge", daemon=True).start()
+    # ★ 独立视频封面预热（低优先级后台）：把「滚到才抽帧」的空白期提前消化掉
+    threading.Thread(target=warm_video_thumbnails, name="warm-video-thumbs",
+                     daemon=True).start()
 
 
 def main():
