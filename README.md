@@ -426,6 +426,28 @@ python server.py --lan
 **环境要求**：Python 3.8+（Windows / macOS / Linux 均可），无需数据库、无需 Docker、
 无第三方 Web 框架 —— 服务端只用标准库 `http.server`。
 
+### ffmpeg（强烈建议安装，否则视频只能是黑封面）
+
+ffmpeg 负责两件事，缺了它这两件事都做不了：
+
+1. **视频封面抽帧** —— 独立视频的缩略图全靠它；没有它 `/thumb` 只能返回 500，
+   格子里就是一个黑块（Live Photo 因为用配对静图当封面，不受影响）。
+2. **HEVC(H.265) → H.264 转码** —— iPhone 的 Live Photo 视频与部分录像都是 HEVC，
+   iOS/Safari 能原生解码，**桌面 Chrome/Edge/Firefox 不能**。此时点 LIVE 只会得到
+   一个黑掉的小窗，必须靠服务端转码。
+
+装到哪里都行，按以下顺序自动探测（找到即用）：
+
+```
+环境变量 FFMPEG_BIN → 项目根目录的 ffmpeg.exe → 若干本机常见路径 → PATH
+```
+
+最省事的做法：把 `ffmpeg.exe` 直接丢进项目根目录。服务启动时探测一次；若启动时
+还没有、之后才放进来，**不用重启** —— 首次用到时会自动补探并接上（间隔 30 秒）。
+`ffmpeg.exe` 已在 `.gitignore` 中，不会进版本库。
+
+可随时访问 `/api/stats` 看 `"ffmpeg": true/false` 确认是否被识别到。
+
 ---
 
 ## 十一、许可与免责声明

@@ -688,8 +688,18 @@ function fallbackMotion(it) {
   v.setAttribute('webkit-playsinline', '');
   // 桌面 / Android：浏览器普遍不认 HEVC → 走 H.264 转码
   v.src = mediaURL('/video', it.mv || it.p, '&t=1');
+  // 转码失败（服务端没装 ffmpeg 会返回 503）时别把黑盒子留给用户：
+  // 撤掉 .motion 让静图继续显示，并说清楚原因。
+  v.onerror = () => {
+    v.dataset.failed = '1';
+    vMedia.classList.remove('motion');
+    $('#vLive').classList.toggle('offline', false);
+    v.style.display = 'none';
+    toast('实况视频无法播放：服务端缺少 ffmpeg（HEVC 需转码后才能在这些浏览器播放）', 5000);
+  };
   vMedia.appendChild(v);
   v.play().then(() => {
+    if (v.dataset.failed) return;
     vMedia.classList.add('motion');
     $('#vLive').hidden = false;
   }).catch(() => {
@@ -701,8 +711,12 @@ function fallbackMotion(it) {
 $('#vLive').onclick = () => {
   const it = currentItem();
   if (!it || !it.live) return;
-  const on = vMedia.classList.toggle('motion');
   const v = vMedia.querySelector('video.v-motion');
+  if (v && v.dataset.failed) {              // 源已失效，别给用户一个黑盒子
+    toast('实况视频不可用：服务端缺少 ffmpeg 或文件格式不支持', 3200);
+    return;
+  }
+  const on = vMedia.classList.toggle('motion');
   if (v) { on ? v.play().catch(() => {}) : v.pause(); }
   $('#vLive').classList.toggle('offline', !on);
   toast(on ? '实况已播放' : '已暂停实况', 1200);

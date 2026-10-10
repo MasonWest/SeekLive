@@ -62,6 +62,14 @@ admin.json
 # ---------- 依赖 ----------
 node_modules/
 
+# ---------- 外部二进制（本机依赖，不是代码）----------
+# ffmpeg 体积近 100MB（超出 GitHub 单文件 100MB 上限），且各平台不通用：
+# 放项目根目录即可被 detect_ffmpeg() 自动探测，或设环境变量 FFMPEG_BIN 指定路径。
+ffmpeg
+ffmpeg.exe
+ffprobe
+ffprobe.exe
+
 # ---------- 照片时间推算脚本的产物 ----------
 # tools/photo_time_repair.py 生成的明细表 / 覆盖表里含本机照片绝对与相对路径
 # （含私有目录名），与本项目的「仓库不带私人路径」原则冲突，一律不进版本库。

@@ -45,7 +45,9 @@ SeekLive · 时光轴（正式版 Demo）· 服务端
 数据目录：data/index.db（索引） ｜ cache/（缩略图/大图/转码） ｜ logs/（运行日志）
 原始照片目录始终只读，不会被写入、修改或删除。
 
-依赖：Pillow / pillow-heif / ffmpeg（HEVC 转码与视频抽帧，可选）
+依赖：Pillow / pillow-heif / ffmpeg（视频封面抽帧 + HEVC→H.264 转码；
+      ffmpeg 缺失时图片与 Live Photo 的静图仍正常，但视频只能显示黑封面、
+      桌面浏览器也无法播放 HEVC 实况 —— 详见 README「ffmpeg」一节）
 """
 
 import os
@@ -463,6 +465,30 @@ def detect_ffmpeg():
             if exe:
                 return exe
     return None
+
+
+_ffmpeg_probe_at = 0.0
+
+
+def ensure_ffmpeg(min_interval=30.0):
+    """
+    取当前可用的 ffmpeg 路径（没有则 None），必要时补探一次。
+
+    启动时已在 main() 里探测过；此后只在「还没找到」时按 min_interval 秒的
+    间隔重试。这样「服务已经跑着、用户才把 ffmpeg.exe 放进项目目录」也能自动
+    接上，不必重启进程 —— 反之若早已就绪则零开销，不再碰文件系统。
+    """
+    global FFMPEG, _ffmpeg_probe_at
+    if FFMPEG:
+        return FFMPEG
+    now = time.time()
+    if now - _ffmpeg_probe_at < min_interval:
+        return None
+    _ffmpeg_probe_at = now
+    FFMPEG = detect_ffmpeg()
+    if FFMPEG:
+        log.info("ffmpeg 已就绪（后补探测）: %s", FFMPEG)
+    return FFMPEG
 
 
 # =========================================================
@@ -1119,7 +1145,7 @@ def probe_video_codec(path):
         c = _mov_codec_boxes(path)
         if c:
             return c
-    if FFMPEG:
+    if ensure_ffmpeg():
         return probe_codec(path)
     return None
 
@@ -2638,7 +2664,10 @@ def pick_thumb(req):
 
 def _grab_frame_raw(path, seek, timeout=35):
     """在 seek 秒处抽一帧原始 JPEG 字节；失败返回 None。"""
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    ffm = ensure_ffmpeg()
+    if not ffm:
+        return None
+    cmd = [ffm, "-hide_banner", "-loglevel", "error"]
     if seek:
         cmd += ["-ss", str(seek)]
     cmd += ["-i", path, "-frames:v", "1",
@@ -2687,8 +2716,8 @@ def gen_video_frame(path, max_side, quality=THUMB_QUALITY, fmt="webp"):
     命中第一个合格帧即停（多数视频 0.5s 就合格，不额外付代价）。全部不合格时
     （例如开场长时间黑底字幕），取最不差的候选帧兜底——保证永远能出图。
     """
-    if not FFMPEG:
-        raise RuntimeError("未找到 ffmpeg，无法为视频生成画面")
+    if not ensure_ffmpeg():
+        raise RuntimeError("未找到 ffmpeg，无法为视频生成画面（把 ffmpeg.exe 放到项目根目录即可）")
     from PIL import Image
 
     best = None          # (score, jpeg_bytes)
@@ -2813,11 +2842,12 @@ def build_transcode(src, lib_id="", rel=""):
         cache_record(key, lib_id, rel, st, "trans",
                      f"h264-crf23|{int(st.st_size)}", os.path.getsize(out))
         return out, True
-    if not FFMPEG:
+    ffm = ensure_ffmpeg()
+    if not ffm:
         return None, False
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tmp = out + f".{os.getpid()}.tmp.mp4"
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+    cmd = [ffm, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
            "-movflags", "+faststart", tmp]
@@ -2873,7 +2903,7 @@ def warm_video_thumbnails(max_per_lib=_WARM_MAX, budget_sec=_WARM_BUDGET_SEC):
     if _warm_started.is_set():
         return 0
     _warm_started.set()
-    if not FFMPEG or INDEX is None:
+    if not ensure_ffmpeg() or INDEX is None:
         return 0
     t0 = time.time()
     made = skipped = 0
@@ -3372,10 +3402,11 @@ def cache_gc_apply(classes=None, full=None):
 
 def probe_codec(src):
     """返回 'h264' / 'hevc' / None"""
-    if not FFMPEG:
+    ffm = ensure_ffmpeg()
+    if not ffm:
         return None
     try:
-        r = subprocess.run([FFMPEG, "-hide_banner", "-i", src],
+        r = subprocess.run([ffm, "-hide_banner", "-i", src],
                            capture_output=True, text=True, timeout=20)
         txt = (r.stderr or "") + (r.stdout or "")
         if "Video: h264" in txt:
@@ -4068,7 +4099,7 @@ class Handler(BaseHTTPRequestHandler):
         s.update({"cacheFiles": cache_files,
                   "cacheMB": round(cache_bytes / 1024 / 1024, 1),
                   "workers": _GEN_WORKERS,
-                  "ffmpeg": bool(FFMPEG), "heif": HEIF_OK,
+                  "ffmpeg": bool(ensure_ffmpeg()), "heif": HEIF_OK,
                   "index": (INDEX.stats() if INDEX else {}),
                   "recheckSeconds": META["scan"].get("recheckSeconds", 0)})
         return self.send_json(s)
@@ -4260,8 +4291,9 @@ class Handler(BaseHTTPRequestHandler):
         trans = (qs.get("t") or ["0"])[0] == "1"
         extra = {}
         if trans:
-            if not FFMPEG:
-                return self.send_err(503, "服务端未找到 ffmpeg")
+            if not ensure_ffmpeg():
+                return self.send_err(
+                    503, "服务端未找到 ffmpeg（HEVC 需转码才能在这些浏览器播放）")
             mb = os.path.getsize(fp) / 1024 / 1024
             if mb > MAX_TRANSCODE_MB:
                 # 整文件转码会让首字节等上几分钟；明确拒绝而不是把连接挂死
