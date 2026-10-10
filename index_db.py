@@ -168,6 +168,25 @@ class Index:
                 "SELECT * FROM files WHERE lib_id=? AND rel=?", (lib_id, rel)).fetchone()
         return dict(r) if r else None
 
+    def iterate_files(self, lib_id):
+        """返回 [(rel, name, mtime)]，供「时间戳取值链升级后重新推导 ts」使用。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT rel, name, mtime FROM files WHERE lib_id=?", (lib_id,))
+            return [(r["rel"], r["name"], r["mtime"]) for r in cur]
+
+    def set_ts_many(self, lib_id, pairs):
+        """pairs: [(ts, rel)] —— 批量更新 files.ts。"""
+        pairs = list(pairs)
+        if not pairs:
+            return 0
+        with self._lock:
+            self.conn.executemany(
+                "UPDATE files SET ts=? WHERE lib_id=? AND rel=?",
+                [(int(ts), lib_id, rel) for ts, rel in pairs])
+            self.conn.commit()
+        return len(pairs)
+
     def upsert_files(self, rows):
         """rows: 可迭代的 dict，键同 files 表列（缺失列用默认值）。"""
         if not rows:
@@ -405,3 +424,27 @@ class Index:
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(version),))
             self.conn.commit()
         return True
+
+    # ---------------- meta 读写 ----------------
+    def meta_get(self, k, default=None):
+        with self._lock:
+            r = self.conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        return r["v"] if r else default
+
+    def meta_set(self, k, v):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO meta(k, v) VALUES(?,?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+            self.conn.commit()
+
+    def needs_ts_refresh(self, version):
+        """
+        时间戳取值链升级？只读判断，不改状态。
+        （真正的重新推导由服务端做，全部成功后再调 mark_ts_version，
+          这样中途中断也不会把升级标记吞掉。）
+        """
+        return self.meta_get("ts_probe_version") != str(version)
+
+    def mark_ts_version(self, version):
+        self.meta_set("ts_probe_version", version)

@@ -196,6 +196,7 @@ python server.py --rebuild-index :: 丢弃索引重建
 | Live Photo       | iOS Safari 走 Apple 原生 LivePhotosKit；其它浏览器走 H.264 动图叠加                                                                                                                |
 | 现代图片格式           | 缩略图输出 **WebP**，平均仅 **5.3 KB**                                                                                                                                        |
 | EXIF 方向修正        | 手机竖拍照片自动摆正                                                                                                                                                           |
+| **拍摄时间取值链**      | 时间轴按**拍摄时间**排序，逐级回退：图片 `EXIF DateTimeOriginal → DateTime` → 视频取「同目录同名的配对静图」→ 视频自身 `mvhd` → 文件名时间戳 → 覆盖表 → `mtime`。老库升级后**自动重算一次**（`TS_PROBE_VERSION`），无需重建索引 |
 | 搜索               | 服务端全文搜索文件名，分页返回                                                                                                                                                      |
 | 年份 / 月份导航        | 顶栏下方常驻 `< 2025 >` 年份切换 + 该年月份条；滚动时自动同步当前年月；点月份直接跳转                                                                                                                   |
 | 月份跳转             | 底部面板一键跳到任意月份                                                                                                                                                         |
@@ -312,6 +313,9 @@ SeekLive/
 | **编码探测算法带版本号**                         | 升级识别逻辑时自动作废旧缓存（`CODEC_PROBE_VERSION`），避免旧值长期污染                    |
 | **缓存键包含 `lib_id`**                     | 多图库下同名文件的缩略图必须隔离，否则会串图                                            |
 | 时间戳只认「被分隔符完整包住」的 10/13 位数字             | 企微的文件名是 UUID，零散数字会被误判成 2098 年                                     |
+| **时间轴用拍摄时间，而不是 mtime**                    | 手机导出名是 `IMG_1644.JPEG`，既没有时间戳，`mtime` 又是「拷贝进硬盘那天」；只靠它会把 2024 年的照片排到拷贝当天 |
+| **视频时间宁可取配对静图，也不信 `mvhd`**               | 实测 914 组 Live Photo 里 **37%** 的 MOV 时间戳被重新导出改写过（整段写成同一个「导出日」），静图 EXIF 才可靠   |
+| **覆盖表只放服务端算不出来的部分**                     | EXIF / 配对 / mvhd / 文件名时间戳服务端自己能读，写进覆盖表只会制造两份真相                        |
 | 同名 `.png` / `.jpg` 视为两个条目              | 真实数据里有 885 组同名不同扩展名的图片                                            |
 
 
@@ -325,6 +329,7 @@ SeekLive/
 | `index_db.py` / `cache_db.py` / `trash_db.py`   | 索引 / 缓存清单 / 回收站账本                        |
 | `web/`                                          | 前端（原生 HTML + CSS + JS，无构建步骤）             |
 | `tests/`                                        | 自动化测试（Python 专项 + Playwright 端到端）        |
+| `tools/photo_time_repair.py`                    | 拍摄时间核查 / 推算脚本（见下方「照片时间不准怎么办」）            |
 | `libraries.example.json` / `admin.example.json` | 配置模板                                     |
 | `一键启动.bat` / `一键结束.bat`                         | Windows 启停脚本                             |
 | `*.md`                                          | 设计文档与验收报告                                |
@@ -339,6 +344,7 @@ SeekLive/
 | `libraries.json`   | 含**本机绝对路径与私有目录名**            |
 | `admin.json`       | 含**管理口令**                    |
 | `tests/e2e/shots/` | 端到端测试截图（**含真实照片画面**）         |
+| `tools/out/`       | 时间核查脚本的产物（**含本机照片路径与私有目录名**）  |
 
 以上全部写在 **`.gitignore`** 里，用 `*.example.json` 提供模板。
 
@@ -349,6 +355,23 @@ python server.py --init        # 生成 libraries.json 模板
 # 把里面的 root 改成你的照片目录
 python server.py --lan         # 启动（Windows 下也可直接双击 一键启动.bat）
 ```
+
+**照片时间不准怎么办**（时间轴排在了「导入日」而不是拍摄日）
+
+时间轴默认读 **EXIF 拍摄时间**；排错的那些文件，基本是真的没有 EXIF
+（截图、聊天软件保存的图、被导出工具改写过元数据的文件）。`tools/photo_time_repair.py`
+可以核查覆盖率、实测推算精度，并为「有 `IMG_数字` 编号但没 EXIF」的文件按编号插值补时间：
+
+```bash
+python tools/photo_time_repair.py report      # 只读核查：覆盖率 + 单调性 + 逐文件明细 CSV
+python tools/photo_time_repair.py cv          # 留一法交叉验证，先看准不准再决定用不用
+python tools/photo_time_repair.py overrides   # 生成覆盖表（只含服务端算不出来的推算值）
+```
+
+覆盖表默认写到 `tools/out/ts_overrides.json`，服务端启动时自动加载（也认
+`data/ts_overrides.json`，或用 `--overrides 路径` 指定）。另有 `apply` / `restore`
+两个模式会**回写文件的 mtime**（先备份、可一键还原）—— 属于改原文件，日常不建议用，
+因为升级取值链本身并不需要动原文件。
 
 **跑测试**（`tests/README.md` 有详细说明）
 

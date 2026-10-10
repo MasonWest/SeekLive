@@ -1,5 +1,14 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ---------------------------------------------------------------------------
+# 注意：这里【刻意不写】#! shebang。
+# Windows 的 py 启动器（py.exe）会读取脚本首行的 shebang 来决定解释器；
+# 若它解析出的 python3 命中 Microsoft Store 的占位程序
+#   %LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe
+# 则启动器会【静默退出】并返回错误码 9009，控制台一个字都不打印 ——
+# 表现就是「双击一键启动.bat 之后什么都没发生」。
+# 本项目仅面向 Windows，不需要 shebang。
+# 启动请用： python server.py   /   py -3 server.py
+# ---------------------------------------------------------------------------
 """
 SeekLive · 时光轴（正式版 Demo）· 服务端
 ==========================================
@@ -30,6 +39,7 @@ SeekLive · 时光轴（正式版 Demo）· 服务端
                                           # 也可写同目录 admin.json（不进版本库）
     python server.py --recheck 300          # 后台定期核对间隔（秒，0=关闭）
     python server.py --rebuild-index        # 丢弃索引重建后退出
+    python server.py --overrides 路径.json    # 指定时间覆盖表（编号插值推算结果）
     python server.py --stop                 # 停止后台服务
 
 数据目录：data/index.db（索引） ｜ cache/（缩略图/大图/转码） ｜ logs/（运行日志）
@@ -88,6 +98,12 @@ INDEX_DB = os.path.join(DATA_DIR, "index.db")
 CACHE_DB_MANIFEST = os.path.join(DATA_DIR, "cache.db")   # 缓存清单（回收缓存用）
 TRASH_DB = os.path.join(DATA_DIR, "trash.db")            # 回收站账本
 TRASH_DIR = os.path.join(DATA_DIR, "trash")              # 回收站文件区（必须在所有图库根目录之外）
+# 时间覆盖表：给「既无 EXIF、编号也推不出」之外的疑难文件补时间
+# 由 tools/photo_time_repair.py 生成；不存在则完全跳过，不影响任何现有行为
+TS_OVERRIDES_CANDIDATES = (
+    os.path.join(DATA_DIR, "ts_overrides.json"),
+    os.path.join(APP_DIR, "tools", "out", "ts_overrides.json"),
+)
 CONFIG_PATH = os.path.join(APP_DIR, "libraries.json")
 
 for _d in (CACHE_DIR, TMP_DIR, LOG_DIR, DATA_DIR, TRASH_DIR, WEB_DIR):
@@ -97,6 +113,10 @@ CACHE_VERSION = "v6"          # 处理算法/缓存键变更时 +1 → 旧缓存
                               # v4→v6：视频封面改为「多时间点候选 + 打分择优」，
                               #        旧的黑色封面缓存（取 0.5s 黑场）随此自动作废重抽
 CODEC_PROBE_VERSION = 2       # 码流探测算法变更时 +1 → 已缓存的 codec 重新探测
+TS_PROBE_VERSION = 1          # ★ 时间戳取值链变更时 +1 → 已入库文件的时间重新推导
+                              #    v0：只认「文件名时间戳 → mtime」
+                              #    v1：EXIF 拍摄时间 → Live Photo 配对静图 → 视频 mvhd
+                              #        → 文件名时间戳 → 覆盖表 → mtime
 
 THUMB_DEFAULT = 320
 THUMB_ALLOWED = (120, 160, 240, 320, 480, 640, 960)
@@ -144,6 +164,8 @@ DEFAULT_SCAN = {
     "ignore": [],             # 追加跳过的目录名
     "recheckSeconds": 300,    # 后台定期核对间隔（秒），0 = 关闭
     "autoRescan": True,       # 启动后是否允许后台核对
+    "exifTime": True,         # 索引时读 EXIF 拍摄时间作为时间轴显示时间
+                              # （关掉 → 退回「文件名时间戳 → mtime」的旧行为）
 }
 
 # 回收站默认配置（可被 libraries.json 的 "trash" 段覆盖）
@@ -609,6 +631,239 @@ def clean_stem(name):
     return re.split(r"[;\s]", os.path.splitext(name)[0])[0]
 
 
+# =========================================================
+#  时间戳取值链（时间轴显示时间）
+# =========================================================
+# 背景：老实现是 `parse_ts(name) or int(mtime)`，即「文件名里的时间戳，取不到就用
+# 文件系统修改时间」。这在手机相册上几乎必然出错 —— iPhone 导出名是 IMG_1644.JPEG，
+# 既没有时间戳，mtime 又是「拷贝进硬盘的那天」，于是 2024 年 5 月的照片会被排到
+# 拷贝当天。真正的拍摄时间一直躺在 EXIF 里，只是从来没被读过。
+#
+# 现在的取值链（越靠前越可信）：
+#   1. 图片 EXIF DateTimeOriginal(36867) / DateTime(306)
+#   2. 视频 → 同目录「同主名」静图的 EXIF（Live Photo 的 mvhd 常被改写，不可信）
+#   3. 视频 → 自身 mvhd creation_time
+#   4. 文件名里的 13 / 10 位时间戳（parse_ts）
+#   5. 覆盖表 ts_overrides.json（编号插值推算，给没有 EXIF 的补）
+#   6. 文件 mtime（最后兜底）
+
+EXIF_TAG_DTO = 36867          # DateTimeOriginal：真正的拍摄时刻
+EXIF_TAG_DT = 306             # DateTime：次选（部分工具只写这个）
+EXIF_TAG_IFD = 0x8769         # Exif 子 IFD（有些机型把拍摄时间放在这里）
+QT_EPOCH_OFFSET = 2082844800  # 1904-01-01 → 1970-01-01 的秒数（QuickTime 纪元）
+TS_SANE_MIN = 315532800       # 1980-01-01，比这更早的当作解析错误
+TS_SANE_MAX = 4102444800      # 2100-01-01，比这更晚的当作解析错误
+EXIF_DT_RE = re.compile(r"(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+# 视频找配对静图时优先探测的扩展名（Windows 文件系统大小写不敏感，.JPEG 也能命中）
+STILL_EXT_TRIES = (".heic", ".heif", ".jpeg", ".jpg", ".png", ".avif", ".tif", ".tiff")
+
+USE_EXIF_TIME = True          # 可被 libraries.json 的 scan.exifTime 关掉（扫描慢时）
+TS_OVERRIDES = {}             # {(lib_id, rel) | ("*", rel): ts}
+TS_OVERRIDES_SRC = ""         # 实际加载到的覆盖表路径（供「系统信息」展示）
+TS_OVERRIDES_PATH_ARG = None  # --overrides 显式指定的路径（优先于候选路径）
+
+
+def _ts_sane(ts):
+    """时间戳合理性闸门：越界的当作「没解析出来」"""
+    return ts if ts and TS_SANE_MIN <= ts <= TS_SANE_MAX else 0
+
+
+def _parse_exif_dt(s):
+    """'2024:05:07 19:35:33' → epoch 秒；解析不了返回 0"""
+    if not s:
+        return 0
+    m = EXIF_DT_RE.match(str(s).strip().replace("\x00", ""))
+    if not m:
+        return 0
+    try:
+        y, mo, d, h, mi, se = (int(x) for x in m.groups())
+        if y < 1980:
+            return 0
+        return _ts_sane(int(time.mktime((y, mo, d, h, mi, se, 0, 0, -1))))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def image_exif_ts(path):
+    """
+    读图片的拍摄时间。只读文件头部的 EXIF，不解码像素，单张 <1ms 量级。
+    优先 DateTimeOriginal；其次 DateTime；再兜一层 Exif 子 IFD。
+    """
+    if not USE_EXIF_TIME:
+        return 0
+    try:
+        from PIL import Image
+    except Exception:
+        return 0
+    try:
+        with Image.open(path) as im:
+            ex = im.getexif()
+            if not ex:
+                return 0
+            for tag in (EXIF_TAG_DTO, EXIF_TAG_DT):
+                ts = _parse_exif_dt(ex.get(tag))
+                if ts:
+                    return ts
+            try:
+                ifd = ex.get_ifd(EXIF_TAG_IFD)
+                for tag in (EXIF_TAG_DTO, EXIF_TAG_DT):
+                    ts = _parse_exif_dt(ifd.get(tag))
+                    if ts:
+                        return ts
+            except Exception:
+                pass
+    except Exception:
+        # 截断 / 损坏 / 不支持的容器：一律当作「没有拍摄时间」，绝不中断扫描
+        return 0
+    return 0
+
+
+def video_mvhd_ts(path):
+    """
+    ISO-BMFF(mp4/mov/m4v) 的 mvhd creation_time。
+    分块扫描（4MB/块，保留 8 字节跨块尾巴），不把整个视频读进内存。
+    注意：这个值**可能是重新导出时被改写的**，所以调用方要先用配对的静图试一次。
+    """
+    if not USE_EXIF_TIME:
+        return 0
+    try:
+        with open(path, "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(4 * 1024 * 1024)
+                if not chunk:
+                    return 0
+                buf = tail + chunk
+                i = buf.find(b"mvhd")
+                if i >= 0:
+                    if i + 16 > len(buf):
+                        return 0
+                    try:
+                        raw = (int.from_bytes(buf[i + 8:i + 16], "big")
+                               if buf[i + 4] == 1
+                               else int.from_bytes(buf[i + 8:i + 12], "big"))
+                    except Exception:
+                        return 0
+                    return _ts_sane(raw - QT_EPOCH_OFFSET)
+                tail = buf[-8:]
+    except OSError:
+        return 0
+
+
+def paired_still_ts(root, rel, name):
+    """
+    Live Photo：视频的拍摄时间应当等于它的静图。
+    实测 914 组配对里有 37% 的 MOV 时间戳被改写（例如整段 IMG_147~162 的 MOV
+    全被写成同一个「导出日」），所以静图 EXIF 优先于 mvhd 是必须的。
+    """
+    if not USE_EXIF_TIME:
+        return 0
+    d = os.path.dirname(rel)
+    base = os.path.join(root, d.replace("/", os.sep)) if d else root
+    stem = clean_stem(name)
+    for e in STILL_EXT_TRIES:
+        p = os.path.join(base, stem + e)          # Windows 下 .jpeg 也能命中 .JPEG
+        if os.path.isfile(p):
+            ts = image_exif_ts(p)
+            if ts:
+                return ts
+    try:                                          # 其它少见扩展名（.mpo/.heics…）兜底
+        for fn in os.listdir(base):
+            if clean_stem(fn) == stem and clean_ext(fn) in IMG_EXT:
+                ts = image_exif_ts(os.path.join(base, fn))
+                if ts:
+                    return ts
+    except OSError:
+        pass
+    return 0
+
+
+def pick_ts(root, lib_id, rel, name, mtime):
+    """
+    时间轴显示时间的唯一入口（见本节顶部的取值链说明）。
+    任何一步失败都安静地往下掉，最后一定回落到 mtime —— 因此**绝不会**因为
+    读不了 EXIF 而让索引失败。
+    """
+    from_path = os.path.join(root, rel.replace("/", os.sep))
+    ext = clean_ext(name)
+    ts = 0
+    if ext in IMG_EXT:
+        ts = image_exif_ts(from_path)
+    elif ext in MOV_EXT:
+        ts = paired_still_ts(root, rel, name) or video_mvhd_ts(from_path)
+    if not ts:
+        ts = parse_ts(name) or 0
+    if not ts:
+        ts = (TS_OVERRIDES.get((lib_id, rel))
+              or TS_OVERRIDES.get(("*", rel)) or 0)
+    return int(_ts_sane(ts)) if ts else int(mtime)
+
+
+def load_ts_overrides(path=None):
+    """
+    加载时间覆盖表。兼容三种写法：
+      {"overrides": {"rel": ts}}           （默认，作用于所有图库）
+      {"overrides": {"lib_id|rel": ts}}    （按图库限定）
+      {"rel": ts}
+    读不到 / 格式错 → 返回 0，静默跳过（这是可选增强，不该影响启动）。
+    """
+    global TS_OVERRIDES, TS_OVERRIDES_SRC
+    TS_OVERRIDES = {}
+    TS_OVERRIDES_SRC = ""
+    if not path:
+        for p in TS_OVERRIDES_CANDIDATES:
+            if os.path.isfile(p):
+                path = p
+                break
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning("时间覆盖表读取失败 %s: %s", path, e)
+        return 0
+    ov = data.get("overrides") if isinstance(data, dict) else None
+    if ov is None:
+        ov = data if isinstance(data, dict) else {}
+    n = 0
+    for k, v in (ov or {}).items():
+        try:
+            ts = int(v)
+        except (TypeError, ValueError):
+            continue
+        if not _ts_sane(ts):
+            continue
+        if "|" in k:
+            lid, rel = k.split("|", 1)
+            TS_OVERRIDES[(lid, rel)] = ts
+        else:
+            TS_OVERRIDES[("*", str(k).replace("\\", "/"))] = ts
+        n += 1
+    if n:
+        TS_OVERRIDES_SRC = path
+    return n
+
+
+def refresh_library_ts(lib):
+    """
+    取值链升级后，把库里**已存在**的文件按新链路重新推导一遍 ts。
+    只改 ts 一列，不重读 MOV / 不重算配对，也不碰原文件。
+    """
+    lid, root = lib["id"], lib["root"]
+    rows = INDEX.iterate_files(lid)
+    if not rows:
+        return 0
+    t0 = time.perf_counter()
+    pairs = []
+    for rel, name, mtime in rows:
+        pairs.append((pick_ts(root, lid, rel, name, mtime), rel))
+    INDEX.set_ts_many(lid, pairs)
+    log.info("时间戳重新推导：%s %d 个文件，用时 %.1fs",
+             lid, len(pairs), time.perf_counter() - t0)
+    return len(pairs)
+
+
 def sniff_ext(path):
     """没有/未知扩展名时，用文件头魔数嗅探类型"""
     try:
@@ -929,7 +1184,7 @@ def scan_library(lib, full=False, lib_index=0, lib_total=0, report=True):
             "lib_id": lid, "rel": rel, "name": name,
             "dir": os.path.dirname(rel), "stem": clean_stem(name),
             "ext": ext, "kind": kind, "size": size, "mtime": mtime,
-            "ts": parse_ts(name) or int(mtime),
+            "ts": pick_ts(root, lid, rel, name, mtime),
             # 文件新增/变化 → 旧的派生缓存一律作废
             "mov_checked": 0, "cid": None, "live_markers": 0, "codec": None,
             "img_checked": 0, "live_ids": None,
@@ -1090,7 +1345,7 @@ def load_libraries(full=False, mode="startup"):
     根目录不可访问时：**保留原有索引**（标记 stale），绝不当作空图库清空。
     全程把两阶段进度写给 /api/index/progress（阶段一没有总数、不产生百分比）。
     """
-    global INDEX, CACHE_INDEX, TRASH
+    global INDEX, CACHE_INDEX, TRASH, USE_EXIF_TIME
     _open_stores()
     idx_reset("full" if full else mode)
     if INDEX.sync_probe_version(CODEC_PROBE_VERSION):
@@ -1109,6 +1364,17 @@ def load_libraries(full=False, mode="startup"):
     scan_cfg = dict(DEFAULT_SCAN)
     scan_cfg.update(cfg.get("scan") or {})
     META["scan"] = scan_cfg
+    USE_EXIF_TIME = bool(scan_cfg.get("exifTime", True))
+    n_ov = load_ts_overrides(TS_OVERRIDES_PATH_ARG)
+    if n_ov:
+        log.info("时间覆盖表已加载：%d 条（%s）", n_ov, TS_OVERRIDES_SRC)
+        print(f"[时间] 覆盖表 {n_ov:,} 条 ← {TS_OVERRIDES_SRC}")
+
+    # 取值链升级 → 已入库文件的时间需要按新链路重算一遍（一次性）
+    refresh_ts = INDEX.needs_ts_refresh(TS_PROBE_VERSION) and not full
+    if refresh_ts:
+        log.info("时间戳取值链已升级 → 重新推导已入库文件的时间")
+
     trash_cfg = dict(DEFAULT_TRASH)
     trash_cfg.update(cfg.get("trash") or {})
     META["trash"] = trash_cfg
@@ -1144,6 +1410,14 @@ def load_libraries(full=False, mode="startup"):
         if entry["exists"]:
             print(f"[扫描] {entry['name']}  ({root})")
             try:
+                if refresh_ts:
+                    try:
+                        n_ts = refresh_library_ts(entry)
+                        if n_ts:
+                            print(f"[时间] {entry['name']}：{n_ts:,} 个文件改用"
+                                  f"拍摄时间（EXIF）重新排序")
+                    except Exception:
+                        log.exception("重新推导时间戳失败 %s", lid)
                 scan_library(entry, full=full, lib_index=n, lib_total=libs_total)
             except Exception as e:
                 log.exception("扫描 %s 失败", lid)
@@ -1170,6 +1444,11 @@ def load_libraries(full=False, mode="startup"):
 
         META["libs"][lid] = entry
         META["lib_order"].append(lid)
+
+    # 全部库都成功重算后才落版本号：中途失败/中断不会把升级标记吞掉，下次启动会重试
+    if refresh_ts:
+        INDEX.mark_ts_version(TS_PROBE_VERSION)
+        log.info("时间戳取值链升级完成，ts_probe_version=%s", TS_PROBE_VERSION)
 
     # 回收站目录必须与所有图库根目录互不包含（双向校验）；不满足则禁用全部管理操作
     ok, why = _trash_safe()
@@ -1799,7 +2078,7 @@ def _index_add_restored(lid, root, details):
             "lib_id": lid, "rel": rel, "name": name,
             "dir": os.path.dirname(rel), "stem": clean_stem(name),
             "ext": ext, "kind": kind, "size": st.st_size, "mtime": st.st_mtime,
-            "ts": parse_ts(name) or int(st.st_mtime),
+            "ts": pick_ts(root, lid, rel, name, st.st_mtime),
             "mov_checked": 0, "cid": None, "live_markers": 0, "codec": None,
             "img_checked": 0, "live_ids": None,
         })
@@ -4156,7 +4435,7 @@ def _bootstrap_async(rc, pt):
 
 
 def main():
-    global FFMPEG, INDEX, CACHE_INDEX, TRASH
+    global FFMPEG, INDEX, CACHE_INDEX, TRASH, TS_OVERRIDES_PATH_ARG
     port, token, lan, init_only = None, None, False, False
     rebuild, recheck = False, None
     i = 1
@@ -4178,6 +4457,8 @@ def main():
             token = sys.argv[i + 1]; i += 2
         elif a == "--admin-token" and i + 1 < len(sys.argv):
             token = sys.argv[i + 1]; i += 2
+        elif a == "--overrides" and i + 1 < len(sys.argv):
+            TS_OVERRIDES_PATH_ARG = sys.argv[i + 1]; i += 2
         elif a == "--lan":
             lan = True; i += 1
         else:
