@@ -538,6 +538,26 @@ const viewer = $('#viewer');
 const vMedia = $('#vMedia');
 let lpkReady = null;
 
+/* ---- 实况声音偏好 ----
+   默认静音，因为「静音 + playsinline」是浏览器允许自动播放的前提。
+   iOS 上还有个额外的事实：Apple 的 LivePhotosKit 根本不出声 —— 它内部把
+   video.muted = true、video.volume = 0，再把帧画到 canvas 上（源码可查），
+   所以想听声音必须换回原生 <video>。点「声音」按钮即完成这次切换。 */
+let liveMuted = true;
+let soundWarned = false;
+try { liveMuted = localStorage.getItem('liveMuted') !== '0'; } catch (e) {}
+
+function setLiveMuted(m, persist = true) {
+  liveMuted = m;
+  if (persist) { try { localStorage.setItem('liveMuted', m ? '1' : '0'); } catch (e) {} }
+  const b = $('#vSound');
+  if (b) {
+    b.classList.toggle('sound-on', !m);
+    b.title = m ? '实况声音：已静音（点击开启）' : '实况声音：已开启（点击静音）';
+    b.setAttribute('aria-label', b.title);
+  }
+}
+
 function ensureLPK() {
   if (lpkReady) return lpkReady;
   lpkReady = new Promise(res => {
@@ -578,6 +598,15 @@ function stopMedia() {
     try { state.viewer.lpk.destroy(); } catch (e) {}
     state.viewer.lpk = null;
   }
+  $$('.lpk-host', vMedia).forEach(el => el.remove());
+}
+
+/* 拆掉画面上的实况层（LPK 实例 + motion 视频），静图保留。
+   用于「声音开关」在两个播放引擎之间切换。 */
+function detachMotion() {
+  stopMedia();
+  $$('video.v-motion', vMedia).forEach(el => el.remove());
+  vMedia.classList.remove('motion');
 }
 function currentItem() { return state.viewer.list[state.viewer.i]; }
 
@@ -597,6 +626,8 @@ function showSlide(idx, dir) {
   $('#vCaption').innerHTML =
     `<div>${fmtFull(it.t)}</div><div class="c2">${esc(it.n)} · ${fmtSize(it.z)}</div>`;
   $('#vLive').hidden = !it.live;
+  $('#vSound').hidden = !it.live;
+  setLiveMuted(liveMuted, false);            // 同步喇叭图标
 
   // 播放按钮标签
   $('#vLive').classList.toggle('offline', false);
@@ -651,25 +682,24 @@ function showSlide(idx, dir) {
 
 /* ---- Live Photo 播放 ----
    iOS Safari → Apple 原生 LivePhotosKit（长按有"实况"动效 + 防抖对齐）
+               但 LPK 是**设计上就静音**的（内部 muted + volume=0，画到 canvas），
+               所以「打开声音」时会切到下面的 <video> 分支。
    其它浏览器 → 静图 + H.264 动图视频叠加（无 CDN 依赖，离线可用）
    注：photoSrc 统一用服务端转码的 JPEG —— 原始 HEIC 在非 Safari 上解不出，
        这是原型阶段已经踩过的坑。 */
 function attachLive(it) {
-  if (IS_IOS) {
+  if (IS_IOS && liveMuted) {
     ensureLPK().then(ok => {
       if (!ok || currentItem() !== it) return fallbackMotion(it);
       try {
         const host = document.createElement('div');
+        host.className = 'lpk-host';
         host.style.cssText =
           'position:absolute;inset:0;margin:auto;width:100%;height:100%';
         vMedia.appendChild(host);
-        const canHevc = (() => {
-          try { return !!document.createElement('video').canPlayType('video/mp4; codecs="hvc1"'); }
-          catch (e) { return false; }
-        })();
         const pl = window.LivePhotosKit.Player(host);
         pl.photoSrc = mediaURL('/photo', it.p, '&fmt=jpeg');
-        pl.videoSrc = mediaURL('/video', it.mv || it.p, canHevc ? '' : '&t=1');
+        pl.videoSrc = mediaURL('/video', it.mv || it.p, canPlayHevc() ? '' : '&t=1');
         pl.play();
         state.viewer.lpk = pl;
       } catch (e) { fallbackMotion(it); }
@@ -682,12 +712,16 @@ function attachLive(it) {
 function fallbackMotion(it) {
   const v = document.createElement('video');
   v.className = 'v-motion';
-  v.muted = true; v.loop = true; v.playsInline = true;
+  // 静音是「自动播放」的前提（Chrome / iOS 都只放行 muted + playsinline）；
+  // 用户点过喇叭之后才尝试带声自动播，被策略拦下就再退回静音。
+  v.muted = liveMuted;
+  v.loop = true; v.playsInline = true;
   v.autoplay = true; v.preload = 'auto';
   v.setAttribute('playsinline', '');
   v.setAttribute('webkit-playsinline', '');
-  // 桌面 / Android：浏览器普遍不认 HEVC → 走 H.264 转码
-  v.src = mediaURL('/video', it.mv || it.p, '&t=1');
+  // 桌面 / Android：浏览器普遍不认 HEVC → 走 H.264 转码；
+  // 转码顺带把 iPhone 的旋转矩阵烘进画面，方向与静图一致。
+  v.src = mediaURL('/video', it.mv || it.p, canPlayHevc() ? '' : '&t=1');
   // 转码失败（服务端没装 ffmpeg 会返回 503）时别把黑盒子留给用户：
   // 撤掉 .motion 让静图继续显示，并说清楚原因。
   v.onerror = () => {
@@ -703,6 +737,16 @@ function fallbackMotion(it) {
     vMedia.classList.add('motion');
     $('#vLive').hidden = false;
   }).catch(() => {
+    if (!v.muted) {
+      // 带声自动播放被浏览器拦下 → 静音重试一次（声音偏好这次不落盘）
+      v.muted = true;
+      setLiveMuted(true, false);
+      if (!soundWarned) {
+        soundWarned = true;
+        toast('浏览器不允许自动带声播放，已静音；点喇叭可手动开声', 3000);
+      }
+      v.play().catch(() => {});
+    }
     // 自动播放被拒时，保留 LIVE 徽标，用户点一下即可
     $('#vLive').hidden = false;
   });
@@ -718,8 +762,21 @@ $('#vLive').onclick = () => {
   }
   const on = vMedia.classList.toggle('motion');
   if (v) { on ? v.play().catch(() => {}) : v.pause(); }
+  // iOS 走 LPK 时没有 <video> 可点，得直接控制播放器实例
+  const pl = state.viewer.lpk;
+  if (pl && !v) { try { on ? pl.play() : pl.pause(); } catch (e) {} }
   $('#vLive').classList.toggle('offline', !on);
   toast(on ? '实况已播放' : '已暂停实况', 1200);
+};
+
+/* 声音开关：在「LPK（静音、有原生手感）」与「原生视频（有声）」之间切换 */
+$('#vSound').onclick = () => {
+  const it = currentItem();
+  if (!it || !it.live) return;
+  setLiveMuted(!liveMuted);
+  detachMotion();
+  attachLive(it);
+  toast(liveMuted ? '实况已静音' : '实况声音已开启', 1400);
 };
 
 function preloadNeighbors() {

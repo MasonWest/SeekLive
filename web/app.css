@@ -303,6 +303,15 @@ main{padding-bottom:calc(var(--safe-b) + 90px)}
 .v-media video.v-motion{
   position:absolute;inset:0;margin:auto;opacity:0;transition:opacity .4s var(--ease);
   border-radius:6px;
+  /* 必须与静图同框：width/height:100% 撑满容器 + object-fit:contain，
+     才能和 .v-still img 的 contain 结果严丝合缝地重叠。
+     起因：iPhone 实况视频的分辨率常常只有 960x720（比视口小），而它只带
+     max-width/max-height 限制 —— max-* 只缩不放，视频就停在自己的原始尺寸上，
+     于是出现「外面一圈静图不动、中间一小块在动」。 */
+  width:100%;height:100%;object-fit:contain;
+  /* 打掉 .v-media video 的深色底：万一实况视频与静图比例不同，
+     留白处露出静图会比露黑边自然 */
+  background:transparent;
 }
 .v-media.motion video.v-motion{opacity:1}
 .v-media .v-load{position:absolute;display:flex;gap:9px;align-items:center;
@@ -336,6 +345,14 @@ main{padding-bottom:calc(var(--safe-b) + 90px)}
   box-shadow:0 0 0 2px rgba(255,255,255,.35);animation:pulse 1.4s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .v-btn.offline .live-pill{opacity:.5}
+
+/* 实况声音开关：#vSound 默认静音（画一道斜杠的喇叭），点亮后换成有声喇叭 */
+#vSound svg{width:21px;height:21px}
+#vSound .s-off{display:block}
+#vSound .s-on{display:none}
+#vSound.sound-on{background:rgba(255,255,255,.22)}
+#vSound.sound-on .s-off{display:none}
+#vSound.sound-on .s-on{display:block}
 
 .v-caption{font-size:13px;font-weight:560;opacity:.95}
 .v-caption .c2{font-size:11.5px;opacity:.6;font-weight:450;margin-top:2px}

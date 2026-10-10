@@ -3446,6 +3446,20 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    # 客户端提前断开（关标签页、灯箱里换图、视频/封面预加载被取消）时，
+    # 复用连接上的下一次读请求行会抛 ConnectionResetError(WinError 10054)。
+    # 这是 HTTP 的日常，不是服务端故障 —— 但基类的 handle_error 会把整段
+    # socketserver 堆栈打到控制台，把真正的错误淹没掉。
+    NET_QUIET = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                 ConnectionError, TimeoutError)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self.NET_QUIET):
+            log.debug("客户端提前断开：%s", client_address[0])
+            return
+        super().handle_error(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

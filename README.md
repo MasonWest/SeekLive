@@ -193,7 +193,8 @@ python server.py --rebuild-index :: 丢弃索引重建
 | **视频封面预热**     | 索引完成后后台低优先级预生成视频封面（与前端 `srcset` 的 160/320/480/640 四档对齐，带 300s 时间预算），消除 iOS 上「滚到才抽帧」的空白期；缩略图加载失败会**静默重试一次**，仍失败则显示明确的视频占位图标，不留空白格 / 问号 |
 | **编码识别**         | 直接解析 MP4 box / Matroska EBML 头部识别编码（**不用起 ffmpeg**，每个约 1ms）                                                                                                          |
 | 编码兼容             | `h264` 原样直出；HEVC(H.265) 在 PC 端**懒转码**为 H.264；iOS 原生支持 HEVC 则不转                                                                                                       |
-| Live Photo       | iOS Safari 走 Apple 原生 LivePhotosKit；其它浏览器走 H.264 动图叠加                                                                                                                |
+| Live Photo       | iOS Safari 走 Apple 原生 LivePhotosKit；其它浏览器走 H.264 动图叠加。**实况默认静音**（自动播放的前提），灯箱顶部有喇叭开关；iOS 点喇叭会切到原生 `<video>`（LPK 按设计不出声） |
+| **实况视频与静图同框**    | 动图视频用 `width/height:100% + object-fit:contain` 撑满灯箱，与静图的内容框像素级重合（手机实况视频常只有 960x720，只给 `max-*` 限制会缩在静图中间）                                              |
 | 现代图片格式           | 缩略图输出 **WebP**，平均仅 **5.3 KB**                                                                                                                                        |
 | EXIF 方向修正        | 手机竖拍照片自动摆正                                                                                                                                                           |
 | **拍摄时间取值链**      | 时间轴按**拍摄时间**排序，逐级回退：图片 `EXIF DateTimeOriginal → DateTime` → 视频取「同目录同名的配对静图」→ 视频自身 `mvhd` → 文件名时间戳 → 覆盖表 → `mtime`。老库升级后**自动重算一次**（`TS_PROBE_VERSION`），无需重建索引 |
@@ -304,6 +305,8 @@ SeekLive/
 | `body` 用 `min-height` 而非 `height:100%` | 写 `height:100%` 会把 body 盒子锁成一屏高，所有 `position:sticky` 子元素一出首屏就失去吸附 |
 | 时间轴跳转后连续几帧重新对齐                         | 网格从骨架换成真图、图片布局是异步的，锚点会被推走，需要收尾对齐                                  |
 | Live Photo 降级**降媒体源**、不降播放器            | 实测 LivePhotosKit 换 H.264 源在 Edge 上照样能播，无需自研                       |
+| 实况**默认静音**，声音做成开关                     | 「muted + playsinline」是浏览器放行自动播放的前提，默认出声等于每次都要用户点；iOS 更别无选择——LPK 源码里就把 `video.muted=true`、`volume=0`，只能换回原生 `<video>` 才有声 |
+| 实况视频按**静图的框**渲染，而不是自己的原始尺寸         | 静图是 `contain` 铺满灯箱的，视频若只受 `max-width/height` 约束，比视口小的 960x720 视频就会缩在中间，出现「外面一圈静图、里面一小块在动」 |
 | 索引阶段不解码图片                              | 12969 张解码需几分钟，秒级索引是体验底线                                           |
 | **用 SQLite 持久化索引，而不是每次重扫**             | 只靠内存索引，每次重启都要重读全部 MOV 头；持久化后日常启动是「读索引」，新增 / 变更才重算                 |
 | **派生字段带 `checked` 标记**                 | MOV 的 CID、图片的 Live 标记只在「新增或变更」时重算，未变的行永不重复解析                      |
@@ -356,6 +359,13 @@ python server.py --init        # 生成 libraries.json 模板
 python server.py --lan         # 启动（Windows 下也可直接双击 一键启动.bat）
 ```
 
+**控制台刷 `ConnectionResetError: [WinError 10054]` 是什么**
+
+客户端提前断开（关标签页、灯箱里换图、视频/封面预加载被取消）时，复用连接上的
+下一次读请求行就会撞上它。这是 HTTP 的日常、不是故障，服务端已用
+`ThreadingHTTPServer.handle_error` 静默掉这类连接级异常（只留 `debug` 日志），
+其余异常照常打印堆栈。
+
 **照片时间不准怎么办**（时间轴排在了「导入日」而不是拍摄日）
 
 时间轴默认读 **EXIF 拍摄时间**；排错的那些文件，基本是真的没有 EXIF
@@ -380,7 +390,9 @@ python tests/test_trash.py         # 回收站：删除/恢复/永久删除/崩�
 python tests/test_cache_gc.py      # 缓存孤儿回收
 python tests/test_admin_auth.py    # 管理授权：无口令/错误口令/登录/会话/过期/退出/日志脱敏
 python tests/test_index.py         # 索引与目录语义（需要素材目录，见下）
+python tests/test_conn_reset.py    # 客户端提前断开不该在控制台刷 Traceback（进程内起服务，不占端口）
 node tests/e2e/verify_ui.js        # 端到端（需先启动服务；Playwright + 本机 Chromium）
+node tests/e2e/qa_live_lightbox.js # 实况灯箱：静图/动图同框 + 声音开关 + 三种条目回归
 ```
 
 > 多数测试在**独立测试树**里跑，不碰真实图库。
