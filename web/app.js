@@ -175,7 +175,7 @@ function buildChips(libs) {
   if (libs.length < 2) box.style.display = 'none';
 }
 
-async function selectLib(id, isBoot = false) {
+async function selectLib(id, isBoot = false, anchor = null) {
   if (state.lib === id && !isBoot) return;
   state.lib = id;
   state.switching = true;                  // 阻止哨兵在切库期间用旧索引渲染
@@ -214,7 +214,9 @@ async function selectLib(id, isBoot = false) {
   if (!state.days.length) { renderEmpty('暂无图片', '这个图库里还没有可显示的图片。'); return; }
   renderNextBatch();
   requestAnimationFrame(syncRail);
-  window.scrollTo(0, 0);
+  // anchor：删除/恢复后的原地重建 → 回到原来那个日期分组；
+  //         首次进入 / 切库（anchor=null）才回顶部。
+  if (anchor) restoreViewAnchor(anchor); else window.scrollTo(0, 0);
 }
 
 /* =====================================================
@@ -1571,8 +1573,53 @@ $('#btnSelect').onclick = () => {
 };
 $('#selCancel').onclick = () => toggleSelectMode(false);
 
+/* ---------------- 保持浏览位置（删除/恢复后）----------------
+   ★ 时间轴是「滚到哪渲染到哪」的懒加载（renderNextBatch 一批 20 个日期分组）。
+     删除/恢复后整段重建，若不干预就会落到顶部 → 用户看到的是「最近的那几个月」，
+     体感像是「跳到别的月份去了」。
+     这里在重建前记住视口顶部那个日期分组（外加组内偏移），重建后：
+       1) 继续 renderNextBatch 直到那个分组被渲染出来；
+       2) 连续几帧把它对齐回原来位置（骨架→真图是异步的，高度会变，
+          思路与 jumpToMonth 的 pinMonth 一致）。
+     找不到原分组时（整组被删空）退到时间上紧邻的下一个分组，仍留在同一时期。 */
+function captureViewAnchor() {
+  const off = topbarOffset();
+  for (const el of $$('.day-blk')) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom > off + 4)                 // 第一个尚未完全滚出上方的分组
+      return { key: el.dataset.key, rel: Math.round(r.top - off) };
+  }
+  return null;
+}
+
+function restoreViewAnchor(anchor) {
+  if (!anchor) return;
+  let idx = state.days.findIndex(d => d.key === anchor.key);
+  let key = anchor.key, rel = anchor.rel;
+  if (idx < 0) {                            // 该日期已不存在 → 取时间上更早的最近一天
+    idx = state.days.findIndex(d => d.key < anchor.key);
+    if (idx < 0) idx = state.days.length - 1;
+    if (idx < 0) return;
+    key = state.days[idx].key; rel = 0;
+  }
+  while (state.renderedDayIdx <= idx && !state.done) renderNextBatch();
+  let n = 0, last = -1, stable = 0;
+  (function frame() {
+    const el = $(`.day-blk[data-key="${key}"]`);
+    if (!el) { requestAnimationFrame(syncRail); return; }
+    const top = el.getBoundingClientRect().top + window.scrollY - topbarOffset() - rel;
+    if (Math.abs(top - last) < 2) stable++; else stable = 0;
+    last = top;
+    window.scrollTo({ top: Math.max(0, top), behavior: 'auto' });
+    if (stable < 4 && ++n < 60) { requestAnimationFrame(frame); return; }
+    requestAnimationFrame(syncRail);
+  })();
+}
+
 /* ---------------- 刷新（删除/恢复后）---------------- */
 async function refreshAfterChange() {
+  // 搜索态没有 .day-blk，captureViewAnchor 会返回 null，行为同以前
+  const anchor = captureViewAnchor();
   try {
     const d = await api('/api/libs');
     state.libs = d.libraries || [];
@@ -1581,7 +1628,7 @@ async function refreshAfterChange() {
   } catch (e) { /* 刷新失败不阻塞主流程 */ }
   const cur = state.lib;
   state.lib = null;                       // 强制重建时间轴
-  await selectLib(cur, true);
+  await selectLib(cur, true, anchor);     // ★ 重建后回到原日期，而不是回顶部
 }
 
 /* ---------------- 删除（= 移入回收站）---------------- */
