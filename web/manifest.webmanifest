@@ -1,0 +1,14 @@
+{
+  "name": "时光轴 · SeekLive",
+  "short_name": "时光轴",
+  "description": "本地照片时间轴与 Live Photo 浏览",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0b0e",
+  "theme_color": "#0a0b0e",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

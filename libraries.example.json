@@ -1,0 +1,38 @@
+{
+  "_说明": "示例配置。复制为 libraries.json 后把 root 改成你自己的照片目录即可。libraries.json 已被 .gitignore 忽略（含本机私有路径，不要提交）。也可以直接运行 `python server.py --init` 生成一份模板。",
+
+  "scan": {
+    "ignoreHidden": true,
+    "ignore": [],
+    "recheckSeconds": 300,
+    "autoRescan": true
+  },
+
+  "trash": {
+    "retentionDays": 30,
+    "purgeIntervalSeconds": 1800,
+    "autoPurge": true
+  },
+
+  "libraries": [
+    {
+      "_说明": "普通照片库：只读浏览。不写 readonly/deletion_enabled 就等同禁止删除。",
+      "id": "photos",
+      "name": "我的照片",
+      "root": "D:/Photos/我的照片"
+    },
+    {
+      "_说明": "Live Photo 库：iPhone 的 .HEIC + 配对 .MOV 放这里。",
+      "id": "live",
+      "name": "Live Photo",
+      "root": "D:/Photos/LivePhoto"
+    },
+    {
+      "_说明": "只读库：readonly=true 时永远禁止删除，任何开关都改不了。deletion_enabled=true 才会在「已配置管理口令」的前提下允许移入回收站。",
+      "id": "videos",
+      "name": "培训视频",
+      "root": "D:/Videos/培训视频",
+      "deletion_enabled": true
+    }
+  ]
+}

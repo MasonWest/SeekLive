@@ -1,0 +1,8 @@
+{
+  "_说明": "把本文件复制为 admin.json 即可开启「源文件管理」授权。admin.json 已被 .gitignore 忽略，不会进版本库。",
+  "_优先级": "命令行 --admin-token / --token 高于本文件。",
+
+  "adminToken": "改成你自己的口令",
+  "sessionHours": 12,
+  "sessionCookieMaxAge": 0
+}

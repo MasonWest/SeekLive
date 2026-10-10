@@ -1,0 +1,71 @@
+# ============================================================
+#  SeekLive · 版本库忽略规则
+#  原则：仓库里只放「代码 + 文档 + 示例配置」，
+#        运行期数据、缓存、日志、私人路径、管理口令一律不进。
+# ============================================================
+
+# ---------- 运行期数据（含索引 / 缓存 / 回收站 / 日志）----------
+# data/          索引库 index.db、缓存清单 cache.db、回收站账本 trash.db 与 data/trash/ 里的真实文件
+# cache/         缩略图 / 大图 / 转码产物 / 视频抽帧
+# logs/          访问日志与调试日志（含本机路径）
+# tmp/           测试用的临时工作树、测试产物、运行输出
+data/
+cache/
+logs/
+tmp/
+
+# 服务自身的运行时标记
+*.pid
+*.port
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------- 本机私有配置 ----------
+# libraries.json 里有本机绝对路径与私有目录名
+# admin.json     里有管理口令
+# 两份都要用 *.example.json 作模板（模板可以提交）
+libraries.json
+admin.json
+
+# 运行期数据库（即便目录规则被改动也兜底）
+*.db
+*.db-wal
+*.db-shm
+*.cache
+*.b64
+
+# ---------- 媒体素材（仓库不携带任何照片 / 视频）----------
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.bmp
+*.heic
+*.heif
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.log
+
+# ---------- 依赖 ----------
+node_modules/
+
+# ---------- 测试生成物 ----------
+tests/e2e/shots/
+tests/**/result*.txt
+tests/**/_admin_srv_*.out
+*.out
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
