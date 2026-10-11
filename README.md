@@ -323,7 +323,8 @@ python server.py --rebuild-index :: 丢弃索引重建
 | **实况视频与静图同框**    | 动图视频用 `width/height:100% + object-fit:contain` 撑满灯箱，与静图的内容框像素级重合（手机实况视频常只有 960x720，只给 `max-*` 限制会缩在静图中间）                                              |
 | 现代图片格式           | 缩略图输出 **WebP**，平均仅 **5.3 KB**                                                                                                                                        |
 | EXIF 方向修正        | 手机竖拍照片自动摆正                                                                                                                                                           |
-| **拍摄时间取值链**      | 时间轴按**拍摄时间**排序，逐级回退：图片 `EXIF DateTimeOriginal → DateTime` → 视频取「同目录同名的配对静图」→ 视频自身 `mvhd` → 文件名时间戳 → 覆盖表 → `mtime`。老库升级后**自动重算一次**（`TS_PROBE_VERSION`），无需重建索引 |
+| **拍摄时间取值链**      | 时间轴按**拍摄时间**排序，逐级回退：图片 `EXIF DateTimeOriginal → DateTime` → 视频取「同目录同名的配对静图」→ 视频自身 `mvhd` → 文件名时间戳 → 覆盖表 → **`IMG_数字` 编号推算** → `mtime`。老库升级后**自动重算一次**（`TS_PROBE_VERSION`），无需重建索引 |
+| **编号推算兜底**       | 完全没有拍摄时间时（EXIF 被导出工具洗掉），用同目录里**有真实时间**的 `IMG_数字` 做锚点插值补一个大致时间；只在锚点之间取值、**绝不外推**，锚点不足 3 个就不猜。避免整批老照片被 `mtime` 排到「导入日」——`scan.inferTime=false` 可关闭 |
 | 搜索               | 服务端全文搜索文件名，分页返回                                                                                                                                                      |
 | 年份 / 月份导航        | 顶栏下方常驻 `< 2025 >` 年份切换 + 该年月份条；滚动时自动同步当前年月；点月份直接跳转                                                                                                                   |
 | 月份跳转             | 底部面板一键跳到任意月份                                                                                                                                                         |
@@ -356,6 +357,7 @@ SeekLive/
 │   ├── test_trash.py         回收站专项（80 项）
 │   ├── test_index.py         索引 / 增量扫描专项（28 项，需素材目录）
 │   ├── test_cache_gc.py      缓存回收专项（20 项，既有四类孤儿）
+│   ├── test_ts_infer.py      拍摄时间编号推算专项（15 项，全合成，不用素材）
 │   ├── test_thumb_spec.py    缩略图单档 640 / 旧参数吸附（24 项）
 │   ├── test_thumb_variant_gc.py 缩略图旧规格回收 obsolete_variant（41 项）
 │   ├── check_frontend_thumb.mjs 前端调用链静态守卫（14 项，无需浏览器）
@@ -463,6 +465,9 @@ SeekLive/
 | 时间戳只认「被分隔符完整包住」的 10/13 位数字             | 企微的文件名是 UUID，零散数字会被误判成 2098 年                                     |
 | **时间轴用拍摄时间，而不是 mtime**                    | 手机导出名是 `IMG_1644.JPEG`，既没有时间戳，`mtime` 又是「拷贝进硬盘那天」；只靠它会把 2024 年的照片排到拷贝当天 |
 | **视频时间宁可取配对静图，也不信 `mvhd`**               | 实测 914 组 Live Photo 里 **37%** 的 MOV 时间戳被重新导出改写过（整段写成同一个「导出日」），静图 EXIF 才可靠   |
+| **编号推算放在覆盖表之后、`mtime` 之前**                | 覆盖表是人工核过的，优先级必须高于自动推算；而 `mtime` 是最不可信的兜底，能推就一定不要用它              |
+| **推算只在同目录锚点之间做插值，绝不外推**               | 编号未必是全局拍摄序（换机、重装会重编号）；只夹在已知区间内取值，宁可保守也不制造离群点               |
+| **推算不碰已有真实时间的记录**                        | 判别依据是 `ts == mtime`（取值链没取到任何东西时的兜底签字）；已有 EXIF 的文件永远不会被改写            |
 | **覆盖表只放服务端算不出来的部分**                     | EXIF / 配对 / mvhd / 文件名时间戳服务端自己能读，写进覆盖表只会制造两份真相                        |
 | 同名 `.png` / `.jpg` 视为两个条目              | 真实数据里有 885 组同名不同扩展名的图片                                            |
 
@@ -515,25 +520,38 @@ python server.py --lan         # 启动（Windows 下也可直接双击 一键�
 **照片时间不准怎么办**（时间轴排在了「导入日」而不是拍摄日）
 
 时间轴默认读 **EXIF 拍摄时间**；排错的那些文件，基本是真的没有 EXIF
-（截图、聊天软件保存的图、被导出工具改写过元数据的文件）。`tools/photo_time_repair.py`
-可以核查覆盖率、实测推算精度，并为「有 `IMG_数字` 编号但没 EXIF」的文件按编号插值补时间：
+（截图、聊天软件保存的图、被导出工具改写过元数据的文件）。
+
+**这种情况现在服务端会自己处理**：取值链在退回 `mtime` 之前，会拿同一个目录里
+**有真实时间**的 `IMG_数字` 当锚点做编号插值，给它们补一个大致时间
+（`infer_library_ts()`，见 `server.py`）。所以**新加图库不需要任何手工步骤** ——
+索引完就排好了；推算只在扫描时跑一次，之后幂等不再改动。想关掉：`libraries.json`
+的 `scan.inferTime: false`。
+
+`tools/photo_time_repair.py` 保留为**核查 / 微调**手段（服务端跑的是同一套算法）：
 
 ```bash
 python tools/photo_time_repair.py report      # 只读核查：覆盖率 + 单调性 + 逐文件明细 CSV
-python tools/photo_time_repair.py cv          # 留一法交叉验证，先看准不准再决定用不用
-python tools/photo_time_repair.py overrides   # 生成覆盖表（只含服务端算不出来的推算值）
+python tools/photo_time_repair.py cv          # 留一法交叉验证，看这套推算到底准不准
+python tools/photo_time_repair.py overrides   # 生成覆盖表（人工复核后用来压过自动推算）
 ```
 
 覆盖表默认写到 `tools/out/ts_overrides.json`，服务端启动时自动加载（也认
-`data/ts_overrides.json`，或用 `--overrides 路径` 指定）。另有 `apply` / `restore`
-两个模式会**回写文件的 mtime**（先备份、可一键还原）—— 属于改原文件，日常不建议用，
-因为升级取值链本身并不需要动原文件。
+`data/ts_overrides.json`，或用 `--overrides 路径` 指定），**优先级高于自动推算**。
+另有 `apply` / `restore` 两个模式会**回写文件的 mtime**（先备份、可一键还原）——
+属于改原文件，日常不建议用，因为升级取值链本身并不需要动原文件。
+
+> 注意：覆盖表按**相对路径**记录，跨图库共用同一个文件时，不同库里同名的相对路径
+> 会互相命中。只有带子目录的相对路径才足够精确（现在生成的都是这种）。
+> 排查时间问题时可以先看 `logs/server.log` 里的
+> `时间推算：<lib> 按 IMG 编号找回 N 个文件的时间（锚点 M 个）`。
 
 **跑测试**（每个测试文件头部都有说明；断言全部落在独立测试树上）
 
 ```bash
 python tests/test_trash.py         # 回收站：删除/恢复/永久删除/崩溃自愈（独立测试树，不碰真实库）
 python tests/test_cache_gc.py      # 缓存孤儿回收（既有四类）
+python tests/test_ts_infer.py      # 拍摄时间编号推算：插值/不外推/锚点不足不动/幂等/开关（全合成）
 python tests/test_thumb_spec.py    # 缩略图单档 640 / 旧参数吸附 / photo 2048 不变
 python tests/test_thumb_variant_gc.py  # 缩略图旧规格回收 obsolete_variant（识别/保护/跳过/apply）
 python tests/test_admin_auth.py    # 管理授权：无口令/错误口令/登录/会话/过期/退出/日志脱敏

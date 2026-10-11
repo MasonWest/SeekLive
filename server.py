@@ -57,6 +57,7 @@ import re
 import json
 import math
 import time
+import bisect
 import shutil
 import socket
 import hmac
@@ -65,6 +66,7 @@ import secrets
 import threading
 import mimetypes
 import subprocess
+import statistics
 import urllib.parse
 import collections
 import logging
@@ -121,6 +123,8 @@ TS_PROBE_VERSION = 1          # ★ 时间戳取值链变更时 +1 → 已入库
                               #    v0：只认「文件名时间戳 → mtime」
                               #    v1：EXIF 拍摄时间 → Live Photo 配对静图 → 视频 mvhd
                               #        → 文件名时间戳 → 覆盖表 → mtime
+                              #    注：v1 之后新增的「IMG 编号推算」（infer_library_ts）
+                              #        挂在扫描流程里、每次扫描都会补，不需要再升版本号。
 
 # ---------- 缩略图档位（第二阶段：收敛为单档 640）----------
 # 三个常量必须**同时**收敛，缺一不可：
@@ -179,6 +183,8 @@ DEFAULT_SCAN = {
     "autoRescan": True,       # 启动后是否允许后台核对
     "exifTime": True,         # 索引时读 EXIF 拍摄时间作为时间轴显示时间
                               # （关掉 → 退回「文件名时间戳 → mtime」的旧行为）
+    "inferTime": True,        # 完全没有拍摄时间时，按 IMG 编号推算（见 infer_library_ts）
+                              # （关掉 → 直接退回文件 mtime）
 }
 
 # 回收站默认配置（可被 libraries.json 的 "trash" 段覆盖）
@@ -729,6 +735,8 @@ USE_EXIF_TIME = True          # 可被 libraries.json 的 scan.exifTime 关掉�
 TS_OVERRIDES = {}             # {(lib_id, rel) | ("*", rel): ts}
 TS_OVERRIDES_SRC = ""         # 实际加载到的覆盖表路径（供「系统信息」展示）
 TS_OVERRIDES_PATH_ARG = None  # --overrides 显式指定的路径（优先于候选路径）
+# 注：HEIC/HEIF 的解码器由本文件末尾的 _register_heif() 在**导入时**注册，
+#     所以下面的 image_exif_ts 读 .heic 是正常的，不需要再单独处理。
 
 
 def _ts_sane(ts):
@@ -930,6 +938,123 @@ def refresh_library_ts(lib):
     log.info("时间戳重新推导：%s %d 个文件，用时 %.1fs",
              lid, len(pairs), time.perf_counter() - t0)
     return len(pairs)
+
+
+# ---------- IMG 编号推算（取值链的最后一环，兜底 mtime 之前）----------
+# 为什么需要它
+#   取值链的最后一环是「文件 mtime」，而 mtime 对手机相册来说只是「拷贝进硬盘
+#   的那天」。新加一个图库后，几百张 EXIF 被导出工具洗掉的老照片会整批排到
+#   「今天」，时间轴顶部就冒出一个毫无意义的当月分组。
+#   而这些文件名几乎都是 IMG_1234.JPG —— 编号本身就是拍摄顺序，可以用它推算。
+#
+# 怎么算（与 tools/photo_time_repair.py 完全一致，那里做了留一法交叉验证：
+#   中位误差 6 分钟，95.7% 在 1 天内）
+#   · 锚点 = 「已经拿到真实时间」且「名字带 IMG 编号」的**图片**（视频 mvhd 不
+#     可信，不参与建模）
+#   · 按**目录**分域建立 编号 → 时间 的映射；目录内锚点不足 3 个时退到顶层目录
+#   · 夹在两锚点之间且两端时间随编号递增 → 线性插值
+#   · 否则取编号最近的锚点（**绝不外推**），再把结果夹回该域的时间范围内
+#   · 没有编号的（PNG/截图等）→ 取同目录锚点的中位数
+#   · 只处理「本来就没有真实时间」的记录，已有真实时间的一律不碰
+#
+# 想关掉：libraries.json 的 scan.inferTime = false（此时直接退回 mtime）
+IMG_NUM_RE = re.compile(r"^IMG_E?(\d+)", re.IGNORECASE)
+
+# 2000-01-01。本项目所有媒体都来自 iPhone（最早 2007 年），早于这个时间的时间戳
+# 只可能来自损坏/归零的容器头（典型表现：某个 MOV 显示成 1991 年），
+# 所以这类值既不能当锚点，也应该被推算重新覆盖。
+TS_ANCHOR_FLOOR = 946684800
+
+DAY_SEC = 86400
+USE_TS_INFER = True
+
+
+def _infer_pick(d, num):
+    """
+    在 {编号: 时间} 里按编号取时间。
+    命中编号取精确值；夹在两点之间且两端时间递增则线性插值；否则取最近的锚点。
+    **不做外推** —— 越界时返回最近的端点值，由调用方再夹一次范围。
+    """
+    nums = sorted(d)
+    if not nums:
+        return None
+    i = bisect.bisect_left(nums, num)
+    if i < len(nums) and nums[i] == num:
+        return d[nums[i]]
+    lo = nums[i - 1] if i > 0 else None
+    hi = nums[i] if i < len(nums) else None
+    if lo is not None and hi is not None and d[hi] > d[lo]:
+        return int(d[lo] + (d[hi] - d[lo]) * ((num - lo) / (hi - lo)))
+    if lo is not None and hi is not None:
+        return d[lo if (num - lo) <= (hi - num) else hi]
+    return d[lo if lo is not None else hi]
+
+
+def _needs_infer(ts, mtime):
+    """这个 ts 是不是「没有真实时间」（兜底值 / 明显损坏的值）"""
+    return ts == int(mtime) or ts < TS_ANCHOR_FLOOR
+
+
+def infer_library_ts(lib):
+    """
+    给库里「没有真实拍摄时间」的文件按 IMG 编号推算大致时间，写回 files.ts。
+    只改 ts 一列：不碰源文件，不碰已有真实时间的记录，不重读 EXIF/MOV。
+    返回 (推算并写回的文件数, 参与建模的锚点数)。
+    """
+    if not USE_TS_INFER:
+        return 0, 0
+    lid = lib["id"]
+    rows = INDEX.ts_rows(lid)
+    if not rows:
+        return 0, 0
+
+    # ---- 建锚点（按目录 / 按顶层目录分域）----
+    by_dir, by_top = {}, {}
+    for _rel, name, d, _ext, kind, ts, mtime in rows:
+        if kind != "img" or _needs_infer(ts, mtime):
+            continue
+        m = IMG_NUM_RE.match(os.path.splitext(name)[0])
+        if not m:
+            continue
+        num = int(m.group(1))
+        by_dir.setdefault(d, {}).setdefault(num, ts)
+        by_top.setdefault(d.split("/")[0], {}).setdefault(num, ts)
+    anchors = sum(len(v) for v in by_dir.values())
+    if not anchors:
+        return 0, 0
+
+    # ---- 逐个补时间 ----
+    pairs = []
+    for rel, name, d, _ext, _kind, ts, mtime in rows:
+        if not _needs_infer(ts, mtime):
+            continue                       # 已有真实时间 → 不动
+        guess = None
+        m = IMG_NUM_RE.match(os.path.splitext(name)[0])
+        if m:
+            num = int(m.group(1))
+            for scope in (by_dir.get(d, {}), by_top.get(d.split("/")[0], {})):
+                if len(scope) < 3:         # 邻居太少 → 不敢推
+                    continue
+                g = _infer_pick(scope, num)
+                if g is None:
+                    continue
+                lo_t, hi_t = min(scope.values()), max(scope.values())
+                span = max(hi_t - lo_t, 7 * DAY_SEC)
+                guess = int(min(max(g, lo_t - span * 0.1), hi_t + span * 0.1))
+                break
+        else:
+            scope = by_dir.get(d, {})
+            if len(scope) >= 3:
+                guess = int(statistics.median(list(scope.values())))
+        if guess is None or abs(guess - ts) < DAY_SEC:
+            continue                       # 推不出来 / 推出来跟现状几乎一样 → 不动
+        pairs.append((guess, rel))
+
+    if pairs:
+        INDEX.set_ts_many(lid, pairs)
+        log.info("时间推算：%s 按 IMG 编号找回 %d 个文件的时间（锚点 %d 个）",
+                 lid, len(pairs), anchors)
+    return len(pairs), anchors
 
 
 def sniff_ext(path):
@@ -1283,6 +1408,13 @@ def scan_library(lib, full=False, lib_index=0, lib_total=0, report=True):
     with INDEX_LOCK:
         do_write()
 
+        # 时间推算：把「没有拍摄时间 → 掉到 mtime」的文件按 IMG 编号找回来。
+        # 必须放在 sync_memory 之前，否则内存视图会拿不到这笔修正。
+        try:
+            infer_library_ts(lib)
+        except Exception:
+            log.exception("时间推算失败 %s", lid)
+
         # 独立视频（未被任何静图认领的 MOV/MP4）：懒探测码流，供前端能力路由
         need = idx.movies_missing_codec(lid, unclaimed_only=True)
         for rel in need[:500]:                     # 单次上限，避免首次启动卡太久
@@ -1415,7 +1547,7 @@ def load_libraries(full=False, mode="startup"):
     根目录不可访问时：**保留原有索引**（标记 stale），绝不当作空图库清空。
     全程把两阶段进度写给 /api/index/progress（阶段一没有总数、不产生百分比）。
     """
-    global INDEX, CACHE_INDEX, TRASH, USE_EXIF_TIME
+    global INDEX, CACHE_INDEX, TRASH, USE_EXIF_TIME, USE_TS_INFER
     _open_stores()
     idx_reset("full" if full else mode)
     if INDEX.sync_probe_version(CODEC_PROBE_VERSION):
@@ -1435,6 +1567,7 @@ def load_libraries(full=False, mode="startup"):
     scan_cfg.update(cfg.get("scan") or {})
     META["scan"] = scan_cfg
     USE_EXIF_TIME = bool(scan_cfg.get("exifTime", True))
+    USE_TS_INFER = bool(scan_cfg.get("inferTime", True))
     n_ov = load_ts_overrides(TS_OVERRIDES_PATH_ARG)
     if n_ov:
         log.info("时间覆盖表已加载：%d 条（%s）", n_ov, TS_OVERRIDES_SRC)
@@ -2325,6 +2458,12 @@ def mgmt_restore(lib, items=None, batch=None, on_conflict="skip"):
                 with INDEX_LOCK:
                     _index_add_restored(lid, lib["root"], details)
                     _repair_groups(lid, lib["root"], affected)
+                    # 恢复走的是 pick_ts，会丢掉编号推算的结果（没有 EXIF 的文件
+                    # 会退回 mtime = 导入日）→ 这里补一次，与扫描流程保持一致
+                    try:
+                        infer_library_ts(lib)
+                    except Exception:
+                        log.exception("恢复后时间推算失败 %s", lid)
                     sync_memory(lib)
                 _scan_cache_invalidate()
             TRASH.audit("restore", lid, batch_id, restored, status,

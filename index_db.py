@@ -175,6 +175,18 @@ class Index:
                 "SELECT rel, name, mtime FROM files WHERE lib_id=?", (lib_id,))
             return [(r["rel"], r["name"], r["mtime"]) for r in cur]
 
+    def ts_rows(self, lib_id):
+        """
+        返回 [(rel, name, dir, ext, kind, ts, mtime)]，供「按 IMG 编号推算时间」使用。
+        需要 dir（分域）与 kind（只用图片当锚点），所以不能复用 iterate_files。
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT rel, name, dir, ext, kind, ts, mtime FROM files WHERE lib_id=?",
+                (lib_id,))
+            return [(r["rel"], r["name"], r["dir"], r["ext"], r["kind"],
+                     r["ts"], r["mtime"]) for r in cur]
+
     def set_ts_many(self, lib_id, pairs):
         """pairs: [(ts, rel)] —— 批量更新 files.ts。"""
         pairs = list(pairs)
