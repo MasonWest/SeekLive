@@ -498,6 +498,7 @@ SeekLive/
 | `libraries.example.json` / `admin.example.json` | 配置模板                                     |
 | `一键启动.bat` / `一键结束.bat`                         | Windows 启停脚本                             |
 | `*.md`                                          | 设计文档与验收报告                                |
+| `CONTRIBUTING.md`    | 开发须知：本机环境的坑 + 几处「改了会静默坏掉」的唯一入口（README 与提交记录里没有的部分） |
 
 **仓库里刻意没有什么**
 
