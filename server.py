@@ -64,6 +64,7 @@ import hmac
 import hashlib
 import secrets
 import threading
+import contextlib
 import mimetypes
 import subprocess
 import statistics
@@ -434,9 +435,64 @@ _inflight_guard = threading.Lock()
 _stats = {"hit": 0, "miss": 0, "gen": 0, "singleflight_wait": 0, "transcode": 0}
 _stats_lock = threading.Lock()
 
-# 图片生成并发闸门：避免几十个请求同时解码打满 CPU
-_GEN_WORKERS = max(2, min(6, (os.cpu_count() or 4)))
+# ---------------------------------------------------------
+# 图片生成并发闸门：**分两条道**
+#   · 后台道（缩略图）：滚一屏会一次涌入几百个请求，全排在这一条队里
+#   · 前台道（大图 / 预览）：独立槽位 + 让行，**永远不排后台的队**
+#
+# 为什么必须分道：缩略图是「一屏几百个」的批量活，大图是「用户正等着看」的
+# 单个活。共用一条 FIFO 队时，用户点开大图要等前面几百张缩略图全部生成完
+# —— 实测（缓存被清空后快滚再点开）大图等了 18.0s。
+# ---------------------------------------------------------
+def _int_env(name, default):
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+_GEN_WORKERS = _int_env("SEEKLIVE_GEN_WORKERS",
+                        max(2, min(6, (os.cpu_count() or 4))))   # 后台：缩略图
+_FG_WORKERS = _int_env("SEEKLIVE_FG_WORKERS",
+                       max(1, min(3, (_GEN_WORKERS + 1) // 2)))   # 前台：大图
+_BG_YIELD = 0.8            # 前台在跑时，后台最多让行这么久（防止饿死后台）
+
 _gen_sem = threading.BoundedSemaphore(_GEN_WORKERS)
+_fg_sem = threading.BoundedSemaphore(_FG_WORKERS)
+_fg_cond = threading.Condition()
+_fg_active = 0             # 正在跑的前台任务数
+_bg_waiting = 0            # 排队等后台槽位的缩略图数（供 /api/stats 观察积压深度）
+_bg_wait_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def gen_gate(foreground=False):
+    """生成槽位。foreground=True 走前台道（大图/预览），不与缩略图抢队。"""
+    global _fg_active, _bg_waiting
+    if foreground:
+        with _fg_cond:
+            _fg_active += 1
+        try:
+            with _fg_sem:
+                yield
+        finally:
+            with _fg_cond:
+                _fg_active -= 1
+                _fg_cond.notify_all()
+        return
+    # 后台：用户正在看的那张优先，先让一让（最多 _BG_YIELD，避免饿死）
+    with _fg_cond:
+        if _fg_active:
+            _fg_cond.wait(timeout=_BG_YIELD)
+    with _bg_wait_lock:
+        _bg_waiting += 1
+    try:
+        with _gen_sem:
+            yield
+    finally:
+        with _bg_wait_lock:
+            _bg_waiting -= 1
 
 
 def bump(k, n=1):
@@ -3031,8 +3087,13 @@ def render_media(fullpath, max_side, quality, fmt):
     return gen_image(fullpath, max_side, quality, fmt)
 
 
-def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra=""):
-    """带磁盘缓存 + 单飞的媒体生成（图片转码 / 视频抽帧）。返回 (bytes, mime, hit)"""
+def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="",
+                 fg=False):
+    """带磁盘缓存 + 单飞的媒体生成（图片转码 / 视频抽帧）。返回 (bytes, mime, hit)
+
+    fg=True → 走**前台道**（用户正在等的那一张：大图 / 回收站预览），
+    不与「滚屏批量生成」的缩略图共用 FIFO 队列。
+    """
     h = cache_key(rel, st.st_mtime, st.st_size, kind + fmt + str(max_side),
                   extra, lib_id=lib["id"])[2]
     cp = cache_path(h[:2], h[2:4], h)
@@ -3047,7 +3108,7 @@ def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="")
     bump("miss")
 
     def produce():
-        with _gen_sem:
+        with gen_gate(foreground=fg):
             data, mime, _, _ = render_media(fullpath, max_side, quality, fmt)
         os.makedirs(os.path.dirname(cp), exist_ok=True)
         tmp = cp + f".{secrets.token_hex(4)}.tmp"
@@ -5024,7 +5085,8 @@ class Handler(BaseHTTPRequestHandler):
         s = dict(_stats)
         s.update({"cacheFiles": cache_files,
                   "cacheMB": round(cache_bytes / 1024 / 1024, 1),
-                  "workers": _GEN_WORKERS,
+                  "workers": _GEN_WORKERS, "fgWorkers": _FG_WORKERS,
+                  "fgActive": _fg_active, "thumbBacklog": _bg_waiting,
                   "ffmpeg": bool(ensure_ffmpeg()), "heif": HEIF_OK,
                   "index": (INDEX.stats() if INDEX else {}),
                   "recheckSeconds": META["scan"].get("recheckSeconds", 0)})
@@ -5219,12 +5281,14 @@ class Handler(BaseHTTPRequestHandler):
             side, quality = (pick_thumb((qs.get("s") or [str(THUMB_DEFAULT)])[0]),
                              THUMB_QUALITY)
             fmt = "webp"                       # 缩略图永远用 webp
+            fg = False                         # 缩略图是批量活 → 后台道
         else:
             side, quality = PHOTO_MAX, PHOTO_QUALITY
+            fg = True                          # 大图是用户正等的 → 前台道
         try:
             st = os.stat(fp)
             data, mime, hit = cached_image(lib, rel, fp, st, kind,
-                                           side, quality, fmt)
+                                           side, quality, fmt, fg=fg)
         except Exception as e:
             log.error("gen fail %s: %s", rel, e)
             return self.send_err(500, f"处理失败: {e}")
@@ -5546,7 +5610,7 @@ def main():
 
     print(f"[能力] HEIC {'✅' if HEIF_OK else '❌'} ｜ "
           f"ffmpeg {'✅' if FFMPEG else '❌'} ｜ "
-          f"WebP ✅ ｜ 生成并发 {_GEN_WORKERS}")
+          f"WebP ✅ ｜ 缩略图并发 {_GEN_WORKERS} ｜ 大图专用 {_FG_WORKERS}")
     print(f"[核对] 后台定期核对 {'每 ' + str(rc) + ' 秒' if rc > 0 else '已关闭'}")
     print(f"[回收站] 到期检查 {'每 ' + str(pt) + ' 秒' if pt > 0 else '仅启动时'}"
           f"（保留 {(META.get('trash') or DEFAULT_TRASH).get('retentionDays')} 天）")

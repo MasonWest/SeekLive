@@ -120,6 +120,13 @@ chk('选择模式下控制器让位', /body\.selecting\s+\.den-ctl\{display:none
 chk('工具栏密度按钮复用同一个五档面板', /#btnDensity'\)\.onclick\s*=\s*openDenSheet/.test(js));
 chk('面板列出 5 个档位且显示实际列数',
   /DENSITY_LEVELS\.forEach/.test(body('buildDenSheet')) && /colsForLevel\(lv\)/.test(body('buildDenSheet')));
+/* 指示点必须与两侧按钮同向：左「−」= 更密集（DENSITY_LEVELS 下标更大），
+   DENSITY_LEVELS 是按「大图→年份」排的，所以第 k 个点对应第 N-1-k 档。
+   写反了就会出现「点右边 + 圆点往左跑」的别扭手感。 */
+chk('指示点按 N-1-档位 反向映射（与 −/＋ 同向）',
+  /k\s*===\s*N\s*-\s*1\s*-\s*state\.density/.test(body('syncDenUI')));
+chk('「−」在左且触发更密集（density+1）', /#denOut'\)\.onclick\s*=\s*\(\)\s*=>\s*setDensity\(state\.density\s*\+\s*1\)/.test(js));
+chk('「＋」在右且触发更宽松（density-1）', /#denIn'\)\.onclick\s*=\s*\(\)\s*=>\s*setDensity\(state\.density\s*-\s*1\)/.test(js));
 
 /* 8. 单档 640 契约不回归 */
 chk('THUMB_SIZE 仍为 640', /const\s+THUMB_SIZE\s*=\s*640\s*;/.test(js));

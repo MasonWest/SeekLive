@@ -332,6 +332,7 @@ async function selectLib(id, isBoot = false, anchor = null) {
   state.items.clear();
   state.search.active = false;
   $('#searchBar').hidden = true;
+  thumbReset();                               // 时间轴整体重建：放掉旧的缩略图队列/观察
   $('#timeline').innerHTML = '';
   $('#endTip').hidden = true;
   rail.hidden = true; syncRailHeight();
@@ -544,6 +545,90 @@ async function loadDay(el) {
   paintGrid(grid, items, key);
 }
 
+/* =====================================================
+   缩略图节流器
+   -----------------------------------------------------
+   浏览器对同一个源只有 ~6 条并发连接。缓存被清空后快滚，一屏一屏地过，
+   几百个 <img> 会同时被派发，连接池一路排到几百名之后 —— 此时用户点开大图，
+   /photo 只能排在队尾（实测等 18.0s，比缩略图本身慢两个数量级）。
+   所以缩略图不再直接写 src，而是进自己的队列：
+     · 由观察器判定「离视口够近」才入队（取代 loading=lazy，避免双重延迟）
+     · 同时最多 THUMB_MAX 个在传 —— 滚得再快也攒不出几百个积压
+     · 打开灯箱时整体挂起，并撤回在途请求，连接池全部让给大图
+   ===================================================== */
+const THUMB_MAX = 6;
+const THUMB_AHEAD = 600;              // 视口外多远开始预取（px）
+const thumbQueue = [];                // 待发元素
+const thumbWaiting = new Set();       // 已入队（防重复）
+const thumbLive = new Set();          // 在传
+let thumbHeld = false;                // 灯箱打开时挂起
+
+const thumbObserver = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (!e.isIntersecting) return;
+    thumbObserver.unobserve(e.target);
+    thumbProbe(e.target);
+  });
+}, { rootMargin: `${THUMB_AHEAD}px 0px` });
+
+function thumbProbe(img) {
+  if (!img || !img.isConnected || !img.dataset.thumbUrl) return;
+  if (thumbWaiting.has(img) || thumbLive.has(img)) return;
+  thumbWaiting.add(img);
+  thumbQueue.push(img);
+  thumbPump();
+}
+function thumbPump() {
+  if (thumbHeld) return;
+  while (thumbLive.size < THUMB_MAX && thumbQueue.length) {
+    const img = thumbQueue.shift();
+    thumbWaiting.delete(img);
+    if (!img.isConnected || !img.dataset.thumbUrl) continue;
+    thumbStart(img);
+  }
+}
+function thumbStart(img) {
+  thumbLive.add(img);
+  const tile = img.closest('.tile');
+  img.onload = () => {
+    img.onload = img.onerror = null;
+    thumbLive.delete(img);
+    if (tile) tile.classList.add('loaded');
+    fitTile(img);
+    thumbPump();
+  };
+  img.onerror = () => {
+    img.onload = img.onerror = null;
+    thumbLive.delete(img);
+    fallbackThumb(img, tile, tile && tile.item, THUMB_SIZE);
+    thumbPump();
+  };
+  img.src = img.dataset.thumbUrl;
+}
+/* 挂起 / 恢复。挂起时把在途的**撤回**（取消请求、腾出连接），URL 留在
+   data-thumb-url 上，灯箱关掉后自动重排 —— 正在看的那张大图因此独占连接池。 */
+function thumbHold(on) {
+  if (on === thumbHeld) return;
+  thumbHeld = on;
+  if (!on) { thumbPump(); return; }
+  Array.from(thumbLive).forEach(img => {
+    thumbLive.delete(img);
+    img.onload = img.onerror = null;
+    if (!img.isConnected) return;
+    if (img.complete && img.naturalWidth) return;     // 已经出来的不动它
+    img.removeAttribute('src');                       // ★ 真正取消在途请求
+    if (!thumbWaiting.has(img)) { thumbWaiting.add(img); thumbQueue.push(img); }
+  });
+}
+/* 时间轴整体重建前调用：清掉队列并断开观察，避免旧节点被观察器一直持有 */
+function thumbReset() {
+  thumbObserver.disconnect();
+  thumbQueue.length = 0;
+  thumbWaiting.clear();
+  thumbLive.forEach(img => { img.onload = img.onerror = null; });
+  thumbLive.clear();
+}
+
 function paintGrid(grid, items, ctxKey) {
   if (grid.dataset.painted === '1') return;
   grid.dataset.painted = '1';
@@ -556,31 +641,34 @@ function paintGrid(grid, items, ctxKey) {
     a.href = 'javascript:void 0';
     a.dataset.idx = i;
     a.dataset.ctx = ctxKey;
+    a.item = it;                              // 供失败重试取原始条目
     let badge = '';
     if (it.live) badge = '<span class="badge live"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>LIVE</span>';
     else if (it.k === 'vid') badge = '<span class="badge"><svg viewBox="0 0 24 24"><path d="M8 6.5l9 5.5-9 5.5z" fill="currentColor" stroke="none"/></svg></span>';
     a.innerHTML = badge + '<span class="pick"></span>' +
-      `<img alt="${esc(it.n)}" decoding="async" loading="lazy" ` +
-      `src="${thumbURL(it.p)}">`;
+      `<img alt="${esc(it.n)}" decoding="async">`;
     const img = a.querySelector('img');
-    img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
-    // ★ 不能用 once：重试后的「第二次失败」仍需接管，否则格子会变成纯空白。
-    img.addEventListener('error', () => fallbackThumb(img, a, it, THUMB_SIZE));
+    img.dataset.thumbUrl = thumbURL(it.p);     // ★ 不写 src：交给节流器派发
     frag.appendChild(a);
   });
   grid.appendChild(frag);
+  grid.querySelectorAll('img[data-thumb-url]').forEach(im => thumbObserver.observe(im));
 }
 
 /* 缩略图加载失败：先静默重试一次（服务端偶发抽帧失败 / 缓存竞态），
    仍失败才落成明确占位（视频给播放图标），绝不留「空白格 / 问号」。
-   ★ 单档后不再有 srcset 需要摘除，重试就是给同一个 640 URL 加一个破缓存参数。 */
+   ★ 单档后不再有 srcset 需要摘除，重试就是给同一个 640 URL 加一个破缓存参数。
+   ★ 重试同样走节流队列，否则一批失败重试会瞬间再打几百个请求。 */
 function fallbackThumb(img, tile, it, side) {
-  if (!img.isConnected) return;              // 已被替换 → 不再处理
+  if (!img || !img.isConnected) return;      // 已被替换 → 不再处理
+  if (!it) return;
   if (img.dataset.retried !== '1') {
     img.dataset.retried = '1';
-    img.src = mediaURL('/thumb', it.p, `&s=${side}&r=${Date.now()}`);
+    img.dataset.thumbUrl = mediaURL('/thumb', it.p, `&s=${side}&r=${Date.now()}`);
+    thumbProbe(img);
     return;
   }
+  if (!tile) return;
   tile.classList.add('loaded');
   tile.style.background = 'var(--bg-3)';
   const ph = document.createElement('span');
@@ -658,6 +746,7 @@ async function runSearch(q) {
   state.searchList = [];
   $('#endTip').hidden = true;
   const tl = $('#timeline');
+  thumbReset();
   tl.innerHTML = '<div class="month-sep">搜索结果</div><div class="grid" id="searchGrid"></div>';
   await loadSearchPage();
 }
@@ -690,15 +779,15 @@ function paintSearch(grid, items, baseIdx) {
     a.className = 'tile'; a.href = 'javascript:void 0';
     a.dataset.idx = baseIdx + i;
     a.dataset.ctx = 'search-results';
+    a.item = it;
     a.innerHTML = (it.live ? '<span class="badge live">LIVE</span>' : '') +
-      `<img alt="${esc(it.n)}" decoding="async" loading="lazy" ` +
-      `src="${thumbURL(it.p)}">`;
+      `<img alt="${esc(it.n)}" decoding="async">`;
     const img = a.querySelector('img');
-    img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
-    img.addEventListener('error', () => fallbackThumb(img, a, it, THUMB_SIZE));
+    img.dataset.thumbUrl = thumbURL(it.p);     // 同样交给节流器，避免搜索页一次拉满
     frag.appendChild(a);
   });
   grid.appendChild(frag);
+  grid.querySelectorAll('img[data-thumb-url]').forEach(im => thumbObserver.observe(im));
 }
 
 function exitSearch() {
@@ -707,6 +796,7 @@ function exitSearch() {
   $('#searchInput').value = '';
   syncTopbarHeight();
   const tl = $('#timeline');
+  thumbReset();
   tl.innerHTML = '';
   state.renderedDayIdx = 0; state.done = false;
   $('#endTip').hidden = true;
@@ -766,6 +856,9 @@ function openViewer(list, idx) {
   state.viewer.i = idx;
   viewer.hidden = false;
   document.body.style.overflow = 'hidden';
+  // ★ 用户要看大图了：先把手上的缩略图全部挂起并撤回，把 6 条连接让出来。
+  //   否则大图请求会排在那几百个缩略图后面（实测 18s）。
+  thumbHold(true);
   $('#vDetail').hidden = true;
   const meta = libMeta() || {};
   $('#vDel').hidden = IS_SHARE() || !meta.canManage || !admin.required;  // 分享访客永不可删
@@ -780,6 +873,7 @@ function closeViewer() {
   stopMedia();
   vMedia.innerHTML = '';
   state.viewer.scale = 1; state.viewer.tx = 0; state.viewer.ty = 0;
+  thumbHold(false);                          // 回到照片墙：缩略图继续
 }
 
 function stopMedia() {
@@ -858,14 +952,16 @@ function showSlide(idx, dir) {
     low.src = thumbURL(it.p);
     const hi = document.createElement('img');
     hi.className = 'v-hi'; hi.alt = esc(it.n);
-    hi.onload = () => { hi.classList.add('ready'); wrap.classList.add('done'); };
+    hi.onload = () => {
+      hi.classList.add('ready'); wrap.classList.add('done');
+      preloadNeighbors();                      // 当前这张到了，再去预取下一张
+    };
     hi.onerror = () => { low.style.filter = 'none'; };
     hi.src = mediaURL('/photo', it.p, '&fmt=jpeg');
     wrap.appendChild(low); wrap.appendChild(hi);
     vMedia.appendChild(wrap);
 
     if (it.live) attachLive(it);
-    preloadNeighbors();
   }
   setChromeVisible(true);
 }
@@ -970,13 +1066,13 @@ $('#vSound').onclick = () => {
 };
 
 function preloadNeighbors() {
+  // ★ 只预取**下一张**，而且是等当前这张出来之后再取。
+  //   以前一打开就连开前后两张 2048 转码：用户正等的那张反而被挤慢了两倍。
   const list = state.viewer.list;
-  [1, -1].forEach(off => {
-    const it = list[(state.viewer.i + off + list.length) % list.length];
-    if (!it || it.k === 'vid') return;
-    const im = new Image();
-    im.src = mediaURL('/photo', it.p, '&fmt=jpeg');
-  });
+  const it = list[(state.viewer.i + 1) % list.length];
+  if (!it || it.k === 'vid') return;
+  const im = new Image();
+  im.src = mediaURL('/photo', it.p, '&fmt=jpeg');
 }
 
 /* ---- 缩放 / 平移 ---- */
@@ -1446,8 +1542,12 @@ function syncDenUI() {
     if (dots.children.length !== DENSITY_LEVELS.length) {
       dots.innerHTML = DENSITY_LEVELS.map(() => '<i></i>').join('');
     }
+    // ★ 圆点从左到右必须与两侧按钮同向：左「−」= 更密集（图更小），右「+」= 更宽松（图更大）。
+    //   而 DENSITY_LEVELS 是按「大图 → 年份」排列的，所以第 k 个点对应第 N-1-k 档。
+    //   否则点「+」圆点反而往左跑，看着别扭。
+    const N = DENSITY_LEVELS.length;
     Array.prototype.forEach.call(dots.children,
-      (d, k) => d.classList.toggle('on', k === state.density));
+      (d, k) => d.classList.toggle('on', k === N - 1 - state.density));
   }
   const out = $('#denOut'), inn = $('#denIn');
   if (out) out.disabled = state.density >= DENSITY_LEVELS.length - 1;  // 已是最密
