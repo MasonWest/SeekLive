@@ -416,14 +416,19 @@ def main():
     # ---------- 14 缓存回收边界 ----------
     print("\n[缓存回收不越界]")
     f = files["a.heic"]
-    h = S.cache_key("a.heic", f["mtime"], f["size"], "thumbwebp320", "",
+    # ★ 用当前启用档（640）：本组只验证「源在回收站 → 受保护」，
+    #   刻意用 640 以免与 obsolete_variant 类别混在一起（旧档保护另见
+    #   tests/test_thumb_variant_gc.py 的专项用例）。
+    h = S.cache_key("a.heic", f["mtime"], f["size"],
+                    "thumbwebp" + str(S.THUMB_DEFAULT), "",
                     lib_id="lib_t")[2]
     cp = os.path.join(S.CACHE_DIR, h[:2], h[2:4], h + ".cache")
     w(cp, b"CACHE-PAYLOAD" * 20)
     S.CACHE_INDEX.record(h, "lib_t", "a.heic", f["mtime"], f["size"],
-                         "thumb", "thumb|webp|320", os.path.getsize(cp))
+                         "thumb", "thumb|webp|" + str(S.THUMB_DEFAULT),
+                         os.path.getsize(cp))
     S.mgmt_delete(lib, ["a.heic"])                        # 源进回收站
-    picked, _ghost, protected, _tf, _tb, _ed = S._gc_collect(None, True, None)
+    picked, _ghost, protected = S._gc_collect(None, True, None)[:3]
     chk("14a 源在回收站 → 其缓存受保护（不判孤儿）",
         cp not in {p["path"] for p in picked} and protected >= 1,
         f"protected={protected}")

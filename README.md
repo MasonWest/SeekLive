@@ -304,7 +304,8 @@ python server.py --rebuild-index :: 丢弃索引重建
 | 双层懒加载            | ① 日期分组按需加载 ② 图片按需加载（首屏只请求可见的约 20 张）                                                                                                                                  |
 | 分页 API           | 列表按「月/日/页」下发，手机端不下载大 JSON                                                                                                                                            |
 | 服务端缓存            | 缩略图 / 大图 / 转码产物全部落盘，命中约 3–9ms；并发单飞只生成一次                                                                                                                              |
-| **孤儿缓存回收**       | 缓存清单 `data/cache.db` 记录每个缓存的来源；失效/残留缓存可**先预览再回收**，且**只删 `cache/` 内文件，绝不触碰源照片**                                                                                       |
+| **孤儿缓存回收**       | 缓存清单 `data/cache.db` 记录每个缓存的来源；失效/残留缓存可**先预览再回收**，且**只删 `cache/` 内文件，绝不触碰源照片**。类别：`tmp_leak`（中断残留）/ `unrecorded`（清单无记录）/ `missing_source`（源已消失）/ `changed_source`（源已改动）/ **`obsolete_variant`（缩略图旧规格，见下）**                       |
+| **缩略图单档 640**     | 缩略图只有**一个规格 640**：同一张照片最多一份缩略图缓存，网格密度只是 CSS 缩放、不再切换图片 URL。历史参数（`s=240/480/960`…）由服务端统一**吸附**到 640，旧书签 / 旧页面不报错也不会生成旧档；升级时可单独执行 `?cls=obsolete_variant` 回收历史旧规格缓存（**源在回收站 / 图库离线一律保留**，不靠文件名猜规格） |
 | **回收站（删除 / 恢复）** | 删除 = **移入 `data/trash/`**（不是永久删除），默认保留 **30 天**可完整恢复；顶栏「**最近删除**」面板可看缩略图 / 删除时间 / **剩余天数**，支持单项与批量恢复，冲突默认**不覆盖**；Live Photo 图片与配对 MOV **成组**处理；服务端强制「需管理授权、只读图库禁止删除」 |
 | **访问控制（默认拒绝）**   | 配了管理口令后，只读接口**默认拒绝**：除首页外壳与身份接口外一律要身份，**本机与局域网同一套规则**；按语义返回 401（未登录）/ 403（越权）/ 404（分享不存在或已撤销）；`access.protectRead:false` 可退回"浏览公开"                       |
 | **免登录分享**       | 管理员手动选择、**一键全选本月**、或**按天选择**（每个日期标题后的选择框）→ 生成 `/s/<256bit 令牌>` 只读链接；链接地址可用 `admin.json → publicUrl` 换成公网域名；**授权集合在创建时固化**并在服务端过滤；令牌只存摘要、明文只回显一次；可随时撤销且**下一个请求立即失效**；分享媒体强制 `private, no-store`（不被 CDN 缓存）    |
@@ -314,7 +315,7 @@ python server.py --rebuild-index :: 丢弃索引重建
 | **30 天自动永久删除**   | 启动检查 + 每 1800 秒定时检查 + **停机补做**；只处理账本中已登记且到期的条目；删前复核路径/类型/链接/归属，**拒绝目录**（不递归删）；「永久删除 / 清空回收站」各自二次确认并写审计                                                               |
 | 流式视频             | MOV/MP4/MKV 支持完整 HTTP Range（206 / Content-Range / Accept-Ranges），256KB 分块发送，**不整读、不预转码**                                                                             |
 | **独立视频**         | 单独录的 `.mov/.mp4/.m4v/.mkv/.webm`（没有同名静图）也会作为条目展示，服务端用 ffmpeg 抽帧做缩略图：**多时间点候选（0.5s→20s）逐点抽帧并做「亮度 + 对比度」打分择优**，避开开场黑场 / 白屏 / 纯色卡，全部不合格时取最接近中灰的一帧兜底 —— 保证永远有封面 |
-| **视频封面预热**     | 索引完成后后台低优先级预生成视频封面（与前端 `srcset` 的 160/320/480/640 四档对齐，带 300s 时间预算），消除 iOS 上「滚到才抽帧」的空白期；缩略图加载失败会**静默重试一次**，仍失败则显示明确的视频占位图标，不留空白格 / 问号 |
+| **视频封面预热**     | 索引完成后后台低优先级预生成视频封面（**只预热当前缩略图档位 640**，与前端请求严格对齐，带 300s 时间预算），消除 iOS 上「滚到才抽帧」的空白期；缩略图加载失败会**静默重试一次**，仍失败则显示明确的视频占位图标，不留空白格 / 问号 |
 | **编码识别**         | 直接解析 MP4 box / Matroska EBML 头部识别编码（**不用起 ffmpeg**，每个约 1ms）                                                                                                          |
 | 编码兼容             | `h264` 原样直出；HEVC(H.265) 在 PC 端**懒转码**为 H.264；iOS 原生支持 HEVC 则不转                                                                                                       |
 | Live Photo       | iOS Safari 走 Apple 原生 LivePhotosKit；其它浏览器走 H.264 动图叠加。**实况默认静音**（自动播放的前提），灯箱顶部有喇叭开关；iOS 点喇叭会切到原生 `<video>`（LPK 按设计不出声） |
@@ -349,11 +350,14 @@ SeekLive/
 │   ├── favicon.svg       图标
 │   └── manifest.webmanifest
 ├── tests/
-│   ├── test_admin_auth.py    管理授权正反两面（82 项）
+│   ├── test_admin_auth.py    管理授权正反两面（87 项）
 │   ├── test_access.py        访问控制 / 分享权限矩阵（104 项，含 keep-alive 撤销回归）
 │   ├── test_trash.py         回收站专项（80 项）
-│   ├── test_index.py         索引 / 增量扫描专项（28 项）
-│   ├── test_cache_gc.py      缓存回收专项（20 项）
+│   ├── test_index.py         索引 / 增量扫描专项（28 项，需素材目录）
+│   ├── test_cache_gc.py      缓存回收专项（20 项，既有四类孤儿）
+│   ├── test_thumb_spec.py    缩略图单档 640 / 旧参数吸附（24 项）
+│   ├── test_thumb_variant_gc.py 缩略图旧规格回收 obsolete_variant（41 项）
+│   ├── check_frontend_thumb.mjs 前端调用链静态守卫（14 项，无需浏览器）
 │   ├── fixture_server.py     E2E 用的隔离夹具服务（临时假图库 + 临时 shares.db）
 │   └── e2e/                  真实浏览器端到端验收
 ├── data/index.db         持久化索引（SQLite，WAL 模式）—— 可随时删
@@ -396,7 +400,7 @@ SeekLive/
 | `POST /api/admin/logout`                     | 退出管理授权并立即失效                                                                      |
 | `GET /api/refresh?lib=all\|<id>`             | 手动重新扫描（增量），返回新增 / 变更 / 删除 / 重解析 MOV 数                                            |
 | `GET /api/cache`                             | 缓存现状（总量 / 图片 / 转码 / 清单 / 空目录数）                                                   |
-| `GET /api/cache/gc`                          | **孤儿缓存预览**（只读，不删任何文件）；`?apply=1` 执行回收；`?cls=` 限定类别；`?full=1` 深度扫描；`?adopt=1` 先收养 |
+| `GET /api/cache/gc`                          | **孤儿缓存预览**（只读，不删任何文件）；`?apply=1` 执行回收；`?cls=` 限定类别（`tmp_leak`/`unrecorded`/`missing_source`/`changed_source`/**`obsolete_variant`**，写错类别直接 400 而**不会**退化成"全部"）；`?full=1` 深度扫描；`?adopt=1` 先收养。执行前会**二次核验**（清单行 / 规格 / 文件大小任一变化即跳过） |
 | `GET /api/trash`                             | 回收站列表（按逻辑项目组聚合 + 剩余天数 + 异常项）                                                     |
 | `GET /api/trash/stats`                       | 回收站占用 / 到期数 / 各库分布 / 管理权限                                                        |
 | `GET /api/trash/thumb?item=&s=`              | **回收站条目的缩略图**（只读，仅账本内可预览条目）                                                      |
@@ -406,7 +410,7 @@ SeekLive/
 | `POST /api/trash/purge`                      | **永久删除所选**（不可恢复）；需二次确认。仅处理账本内已登记条目                                               |
 | `POST /api/trash/empty`                      | **清空回收站**（不可恢复）；需二次确认                                                            |
 | `GET /api/stats`                             | 缓存命中 / 生成 / 转码 / 缓存体积                                                            |
-| `GET /thumb?lib=&p=&s=`                      | 缩略图（WebP，缓存）                                                                     |
+| `GET /thumb?lib=&p=&s=`                      | 缩略图（WebP，缓存）。**只有 640 一档**：任何 `s` 值（含缺失 / 畸形 / 历史值）都被吸附到 640 |
 | `GET /photo?lib=&p=&fmt=webp\|jpeg`          | 大图（最长边 2048）                                                                     |
 | `GET /raw?lib=&p=`                           | 原图（支持 Range）                                                                     |
 | `GET /video?lib=&p=&t=0\|1`                  | 视频（`t=1` 时 HEVC→H.264 转码）                                                        |
@@ -523,15 +527,18 @@ python tools/photo_time_repair.py overrides   # 生成覆盖表（只含服务�
 两个模式会**回写文件的 mtime**（先备份、可一键还原）—— 属于改原文件，日常不建议用，
 因为升级取值链本身并不需要动原文件。
 
-**跑测试**（`tests/README.md` 有详细说明）
+**跑测试**（每个测试文件头部都有说明；断言全部落在独立测试树上）
 
 ```bash
 python tests/test_trash.py         # 回收站：删除/恢复/永久删除/崩溃自愈（独立测试树，不碰真实库）
-python tests/test_cache_gc.py      # 缓存孤儿回收
+python tests/test_cache_gc.py      # 缓存孤儿回收（既有四类）
+python tests/test_thumb_spec.py    # 缩略图单档 640 / 旧参数吸附 / photo 2048 不变
+python tests/test_thumb_variant_gc.py  # 缩略图旧规格回收 obsolete_variant（识别/保护/跳过/apply）
 python tests/test_admin_auth.py    # 管理授权：无口令/错误口令/登录/会话/过期/退出/日志脱敏
 python tests/test_access.py        # 访问控制 / 分享权限矩阵（进程内 hermetic，104 项，含 keep-alive 撤销回归）
 python tests/test_index.py         # 索引与目录语义（需要素材目录，见下）
 python tests/test_conn_reset.py    # 客户端提前断开不该在控制台刷 Traceback（进程内起服务，不占端口）
+node tests/check_frontend_thumb.mjs # 前端缩略图调用链静态守卫（无需浏览器/Playwright）
 node tests/e2e/verify_ui.js        # 端到端（需先启动服务；Playwright + 本机 Chromium）
 node tests/e2e/qa_live_lightbox.js # 实况灯箱：静图/动图同框 + 声音开关 + 三种条目回归
 node tests/e2e/qa_keep_scroll.js   # 删除/恢复后保持浏览位置（不真删图：只跑重建路径）

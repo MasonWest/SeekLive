@@ -56,7 +56,9 @@ function canPlayHevc() {
   } catch (e) { return false; }
 }
 
-const THUMB_VARIANTS = [160, 320, 480, 640];
+/* ★ 缩略图只有一个规格：640（与后端 THUMB_KEEP_SIDES 对齐）。
+   不再有 srcset 候选集 —— 同一张源图只生成/请求一份缓存，网格密度只是 CSS 缩放。 */
+const THUMB_SIZE = 640;
 const DENSITY_STEPS = [110, 150, 210];      // 单块目标宽度（px）
 const TILE_BATCH = 20;                      // 每次追加的日期分组数
 const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
@@ -123,19 +125,11 @@ function shareExpired() {
 function mediaURL(ep, rel, extra = '') {
   return `${ep}?lib=${enc(state.lib)}&p=${enc(rel)}${extra}`;
 }
-/* 尺寸档 srcset。
-   网络自适应：若本会话内刚观察到「缩略图普遍取不到」，60 秒内降级为单档请求，
-   避免 srcset 把一次失败放大成 N 次（弱网 / 服务端临时故障时更稳）；到期自动恢复。 */
-function thumbLite() {
-  try {
-    const t = +sessionStorage.getItem('thumbLiteAt') || 0;
-    return t > 0 && (Date.now() - t) < 60000;
-  } catch (e) { return false; }
-}
-function thumbSrcset(rel) {
-  if (thumbLite()) return mediaURL('/thumb', rel, '&s=640');
-  return THUMB_VARIANTS
-    .map(s => `${mediaURL('/thumb', rel, '&s=' + s)} ${s}w`).join(', ');
+/* 缩略图 URL：单档 640，永远只有这一个规格。
+   ★ 服务端仍会把任意历史参数（s=240/480/960…）吸附到 640，因此老书签 / 老页面
+     也不会报错、更不会生成旧档；这里统一走常量，不依赖隐式吸附。 */
+function thumbURL(rel) {
+  return mediaURL('/thumb', rel, '&s=' + THUMB_SIZE);
 }
 
 let toastTimer = null;
@@ -454,7 +448,6 @@ function paintGrid(grid, items, ctxKey) {
   grid.dataset.painted = '1';
   grid.innerHTML = '';                        // 移除骨架
   grid.style.minHeight = '';                  // 真图自带高度，清掉预估
-  const sizes = `${(100 / state.cols).toFixed(2)}vw`;
   const frag = document.createDocumentFragment();
   items.forEach((it, i) => {
     const a = document.createElement('a');
@@ -467,29 +460,23 @@ function paintGrid(grid, items, ctxKey) {
     else if (it.k === 'vid') badge = '<span class="badge"><svg viewBox="0 0 24 24"><path d="M8 6.5l9 5.5-9 5.5z" fill="currentColor" stroke="none"/></svg></span>';
     a.innerHTML = badge + '<span class="pick"></span>' +
       `<img alt="${esc(it.n)}" decoding="async" loading="lazy" ` +
-      `srcset="${thumbSrcset(it.p)}" sizes="${sizes}">`;
+      `src="${thumbURL(it.p)}">`;
     const img = a.querySelector('img');
     img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
     // ★ 不能用 once：重试后的「第二次失败」仍需接管，否则格子会变成纯空白。
-    img.addEventListener('error', () => fallbackThumb(img, a, it, 320));
+    img.addEventListener('error', () => fallbackThumb(img, a, it, THUMB_SIZE));
     frag.appendChild(a);
   });
   grid.appendChild(frag);
 }
 
 /* 缩略图加载失败：先静默重试一次（服务端偶发抽帧失败 / 缓存竞态），
-   仍失败才落成明确占位（视频给播放图标），绝不留「空白格 / 问号」。 */
-let thumbFailStreak = 0;
+   仍失败才落成明确占位（视频给播放图标），绝不留「空白格 / 问号」。
+   ★ 单档后不再有 srcset 需要摘除，重试就是给同一个 640 URL 加一个破缓存参数。 */
 function fallbackThumb(img, tile, it, side) {
   if (!img.isConnected) return;              // 已被替换 → 不再处理
-  thumbFailStreak++;
-  if (thumbFailStreak >= 6) {                // 连续失败 → 本会话 60s 内降级单档
-    try { sessionStorage.setItem('thumbLiteAt', String(Date.now())); } catch (e) {}
-  }
   if (img.dataset.retried !== '1') {
     img.dataset.retried = '1';
-    img.removeAttribute('srcset');
-    img.sizes = '';
     img.src = mediaURL('/thumb', it.p, `&s=${side}&r=${Date.now()}`);
     return;
   }
@@ -596,7 +583,6 @@ async function loadSearchPage() {
 }
 
 function paintSearch(grid, items, baseIdx) {
-  const sizes = `${(100 / state.cols).toFixed(2)}vw`;
   const frag = document.createDocumentFragment();
   items.forEach((it, i) => {
     const a = document.createElement('a');
@@ -605,10 +591,10 @@ function paintSearch(grid, items, baseIdx) {
     a.dataset.ctx = 'search-results';
     a.innerHTML = (it.live ? '<span class="badge live">LIVE</span>' : '') +
       `<img alt="${esc(it.n)}" decoding="async" loading="lazy" ` +
-      `srcset="${thumbSrcset(it.p)}" sizes="${sizes}">`;
+      `src="${thumbURL(it.p)}">`;
     const img = a.querySelector('img');
     img.addEventListener('load', () => { a.classList.add('loaded'); fitTile(img); }, { once: true });
-    img.addEventListener('error', () => fallbackThumb(img, a, it, 320));
+    img.addEventListener('error', () => fallbackThumb(img, a, it, THUMB_SIZE));
     frag.appendChild(a);
   });
   grid.appendChild(frag);
@@ -745,7 +731,7 @@ function showSlide(idx, dir) {
     v.controls = true; v.playsInline = true; v.preload = 'metadata';
     v.setAttribute('playsinline', '');
     v.setAttribute('webkit-playsinline', '');
-    v.poster = mediaURL('/thumb', it.p, '&s=640');
+    v.poster = thumbURL(it.p);
 
     let useTrans = (it.c === 'hevc' || !it.c) ? !canPlayHevc() : false;
     const setSrc = () => { v.src = mediaURL('/video', it.p, useTrans ? '&t=1' : ''); };
@@ -768,7 +754,7 @@ function showSlide(idx, dir) {
     wrap.className = 'v-still';
     const low = document.createElement('img');
     low.className = 'v-low'; low.alt = '';
-    low.src = mediaURL('/thumb', it.p, '&s=480');
+    low.src = thumbURL(it.p);
     const hi = document.createElement('img');
     hi.className = 'v-hi'; hi.alt = esc(it.n);
     hi.onload = () => { hi.classList.add('ready'); wrap.classList.add('done'); };
@@ -1263,8 +1249,8 @@ $('#btnGc').onclick = async e => {
 $('#btnDensity').onclick = () => {
   state.density = (state.density + 1) % DENSITY_STEPS.length;
   computeCols();
-  // 重绘已加载网格的 sizes
-  $$('.grid img').forEach(img => { img.sizes = `${(100 / state.cols).toFixed(2)}vw`; });
+  // ★ 密度只改 CSS 列数（--cols），不改图片 URL：网格里永远是同一份 640 缩略图，
+  //   由浏览器等比缩放显示。这也是单档 640 能省下一整套多档缓存的原因。
   toast(['大图', '标准', '紧凑'][2 - state.density] + '视图', 1200);
 };
 
@@ -2121,7 +2107,7 @@ let trashStats = {};
 const trashSel = new Set();
 
 function trashThumbURL(itemId, s) {
-  return `/api/trash/thumb?item=${enc(itemId)}&s=${s || 320}`;
+  return `/api/trash/thumb?item=${enc(itemId)}&s=${s || THUMB_SIZE}`;
 }
 function typeLabel(g) {
   return g.type === 'video' ? '视频' : (g.type === 'live' ? '实况' : '照片');
@@ -2218,7 +2204,7 @@ function renderTrash() {
     el.innerHTML =
       `<div class="t-thumb">` +
         (g.live ? '<span class="t-live">LIVE</span>' : '') +
-        `<img loading="lazy" alt="" src="${trashThumbURL(first.itemId, 240)}">` +
+        `<img loading="lazy" alt="" src="${trashThumbURL(first.itemId, THUMB_SIZE)}">` +
         `<span class="t-k">${typeLabel(g)}</span>` +
       `</div>` +
       `<div class="t-mid">` +

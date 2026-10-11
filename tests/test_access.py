@@ -287,7 +287,7 @@ def run_matrix(base):
         st, _, _ = req(base, p)
         chk(f"匿名 GET {p.split('?')[0]} → 401", st == 401, f"HTTP {st}")
 
-    for p, hd in (("/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=160", {}),
+    for p, hd in (("/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=640", {}),
                   ("/photo?lib=t&p=" + urllib.parse.quote(R[0]), {}),
                   ("/raw?lib=t&p=" + urllib.parse.quote(R[0]), {}),
                   ("/video?lib=t&p=" + urllib.parse.quote(MOV2), {"Range": "bytes=0-99"})):
@@ -340,7 +340,7 @@ def run_matrix(base):
     st, _, _ = req(base, "/raw?lib=t&p=" + urllib.parse.quote(R[0]),
                    headers={"Range": "bytes=0-9"}, cookies=ck_admin)
     chk("管理员 /raw Range → 206", st == 206, f"HTTP {st}")
-    st, hd, _ = req(base, "/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=160",
+    st, hd, _ = req(base, "/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=640",
                     cookies=ck_admin)
     chk("管理员 /thumb → 200", st == 200, f"HTTP {st}")
     chk("管理员媒体响应头仍是 public（不改缓存策略）",
@@ -436,7 +436,7 @@ def run_matrix(base):
     st, _, _ = req(base, "/video?lib=t&p=" + urllib.parse.quote(MOV2),
                    headers={"Range": "bytes=0-99"}, cookies=ck_share)
     chk("分享访客 /video（配对视频） → 206", st == 206, f"HTTP {st}")
-    st, _, _ = req(base, "/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=160",
+    st, _, _ = req(base, "/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=640",
                    cookies=ck_share)
     chk("分享访客 /thumb 授权条目 → 非 401/403", st not in (401, 403), f"HTTP {st}")
 

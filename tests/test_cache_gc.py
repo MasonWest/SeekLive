@@ -14,6 +14,9 @@
   8. 执行清理           → 只删 cache/ 内文件；源文件 100% 完好
   9. 清单幽灵行         → 自动清掉
  10. 清理后再次预览     → 孤儿归零
+
+> 缩略图「旧规格（非 640）」的识别与回收见 tests/test_thumb_variant_gc.py；
+> 本文件聚焦既有的四类孤儿语义不回归。
 """
 import os
 import sys
@@ -103,9 +106,13 @@ def main():
     mt_c, sz_c = st_of("clip.mp4")
 
     print("\n【1】有效缓存不被判为孤儿")
-    make_cache("a.jpg", mt_a, sz_a, "thumb", "thumb|webp|320", b"t" * 500)
+    # ★ 缩略图统一为单档 640 后，「有效缓存」必须用启用档 640，
+    #   否则会被 obsolete_variant 正确判为旧规格（见 test_thumb_variant_gc.py）。
+    make_cache("a.jpg", mt_a, sz_a, "thumb", "thumb|webp|640",
+               b"t" * 500, side=640)
     make_cache("a.jpg", mt_a, sz_a, "photo", "photo|webp|2048", b"P" * 9000)
-    make_cache("clip.mp4", mt_c, sz_c, "thumb", "thumb|webp|320", b"v" * 700)
+    make_cache("clip.mp4", mt_c, sz_c, "thumb", "thumb|webp|640",
+               b"v" * 700, side=640)
     plan = S.cache_gc_plan()
     chk("缓存文件总数 = 3", plan["cache"]["files"] == 3, plan["cache"]["files"])
     chk("孤儿 = 0", plan["orphan"]["files"] == 0, plan["orphan"]["files"])
@@ -152,8 +159,9 @@ def main():
     with open(os.path.join(SRC, "a.jpg"), "wb") as f:
         f.write(b"IMG-A" * 100)
     mt_a2, sz_a2 = st_of("a.jpg")
+    # 刻意用「已停用的旧规格 480」：离线保护必须**优先于** obsolete_variant 判定
     h_ok, p_ok = make_cache("a.jpg", mt_a2, sz_a2, "thumb",
-                            "thumb|webp|480", b"K" * 300)
+                            "thumb|webp|480", b"K" * 300, side=480)
     S.META["libs"]["lib_a"]["stale"] = True
     S.META["libs"]["lib_a"]["exists"] = False
     plan = S.cache_gc_plan()

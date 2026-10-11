@@ -304,7 +304,7 @@ def main():
 
         # 匿名浏览：照片 / 视频 / Live Photo 媒体（绝不加登录）
         st, _, _ = request(s.base + f"/thumb?lib={img_lib}&p="
-                           + urllib.parse.quote(img_rel) + "&s=160")
+                           + urllib.parse.quote(img_rel) + "&s=640")
         chk("无口令 · 匿名 /thumb → 200（缩略图）", st == 200, f"HTTP {st}")
         st, _, _ = request(s.base + f"/photo?lib={img_lib}&p="
                            + urllib.parse.quote(img_rel))
@@ -369,7 +369,7 @@ def main():
         chk("有口令 · 匿名浏览 API → 401（默认拒绝）", api_denied, " ".join(detail))
 
         media_probes = (
-            ("/thumb", f"/thumb?lib={img_lib}&p=" + urllib.parse.quote(img_rel) + "&s=160", {}),
+            ("/thumb", f"/thumb?lib={img_lib}&p=" + urllib.parse.quote(img_rel) + "&s=640", {}),
             ("/photo", f"/photo?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
             ("/raw", f"/raw?lib={img_lib}&p=" + urllib.parse.quote(img_rel), {}),
             ("/video", f"/video?lib={vid_lib}&p=" + urllib.parse.quote(vid_rel),

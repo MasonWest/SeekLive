@@ -122,8 +122,17 @@ TS_PROBE_VERSION = 1          # ★ 时间戳取值链变更时 +1 → 已入库
                               #    v1：EXIF 拍摄时间 → Live Photo 配对静图 → 视频 mvhd
                               #        → 文件名时间戳 → 覆盖表 → mtime
 
-THUMB_DEFAULT = 320
-THUMB_ALLOWED = (120, 160, 240, 320, 480, 640, 960)
+# ---------- 缩略图档位（第二阶段：收敛为单档 640）----------
+# 三个常量必须**同时**收敛，缺一不可：
+#   · THUMB_KEEP_SIDES  唯一启用档位 —— 既是 pick_thumb() 的吸附目标，
+#                       也是 GC「旧规格」判定的启用集合唯一来源（见 thumb_side_of）。
+#   · THUMB_ALLOWED     直接引用它 → 任何历史参数（s=240/480/960…）都被吸附到 640，
+#                       于是**不存在任何旧档生成路径**，也就不会有「边回收边生成」的抖动。
+#   · THUMB_DEFAULT     解析失败时的兜底值。★ 若不跟着改成 640，pick_thumb() 在
+#                       解析失败时会直接返回旧值并**凭空生成旧档**（旧版此坑见风险 R7）。
+THUMB_KEEP_SIDES = (640,)
+THUMB_ALLOWED = THUMB_KEEP_SIDES
+THUMB_DEFAULT = 640
 THUMB_QUALITY = 78
 PHOTO_MAX = 2048
 PHOTO_QUALITY = 84
@@ -2702,11 +2711,43 @@ HEIF_OK = _register_heif()
 
 
 def pick_thumb(req):
+    """把任意请求的规格参数吸附到当前启用档位。
+
+    ★ 是「吸附」（取最近的允许档）而不是「拒绝」：旧书签 / 旧页面 / 回收站传来的
+      `s=240`、`s=480` 等不会报错，只会被统一吸到 640 —— URL 参数向后兼容由此保证。
+      `int()` 解析失败（缺参 / 畸形 / 空串）→ THUMB_DEFAULT（同样必须是 640）。
+    """
     try:
         s = int(req)
     except (TypeError, ValueError):
         return THUMB_DEFAULT
     return min(THUMB_ALLOWED, key=lambda x: abs(x - s))
+
+
+def thumb_enabled_sides():
+    """当前「启用」的缩略图规格集合 —— GC 判定旧规格的唯一事实来源。
+
+    ★ 刻意由 THUMB_KEEP_SIDES 推导，而**不是**写死旧档名单（如 {160,320,480}）：
+      判定式是「∉ 启用集合」，因此 120 / 240 / 960 / 以及任何历史残留的未知规格
+      都会被覆盖，不会继续在磁盘上积累。
+    """
+    return {int(s) for s in THUMB_KEEP_SIDES}
+
+
+def thumb_side_of(variant):
+    """从缓存清单的 variant 字段解析缩略图边长。
+
+        'thumb|webp|640'              -> 640
+        'thumb|webp|240|trash:it-xxx' -> 240     （extra 段不影响解析，只取第 3 段）
+        非缩略图 / 格式不认识           -> None    （调用方必须据此**保留**，不得猜删）
+
+    ★ 只用「清单记录里的 variant」，绝不去解析磁盘文件名 —— 文件名是 sha256，
+      反向猜测既不可靠也不安全。
+    """
+    parts = (variant or "").split("|")
+    if len(parts) >= 3 and parts[0] == "thumb" and parts[2].strip().isdigit():
+        return int(parts[2])
+    return None
 
 
 def _grab_frame_raw(path, seek, timeout=35):
@@ -2931,9 +2972,9 @@ def build_transcode(src, lib_id="", rel=""):
 # ---------- 视频封面预热 ----------
 _WARM_MAX = 240                 # 单库预热上限（避免超大视频库拖长启动占用）
 _WARM_BUDGET_SEC = 300          # 预热总时间预算：超时即收工，绝不影响正常服务
-# 必须与 web/app.js 的 THUMB_VARIANTS 对齐 —— 前端 srcset 只会请求这几档，
-# 预热别的档位等于白做（浏览器选不中，仍旧现抽）。
-_WARM_THUMB_SIDES = (160, 320, 480, 640)
+# 必须与前端实际请求的档位对齐 —— 前端只会请求 THUMB_KEEP_SIDES 里的档，
+# 预热别的档位等于白做（浏览器选不中，仍旧现抽；生成的文件还会立刻变成待回收对象）。
+_WARM_THUMB_SIDES = THUMB_KEEP_SIDES
 _warm_started = threading.Event()
 
 
@@ -3001,12 +3042,14 @@ def warm_video_thumbnails(max_per_lib=_WARM_MAX, budget_sec=_WARM_BUDGET_SEC):
 #    本段落只读 cache/ 目录，删除时再做 realpath 前缀双校验，
 #    任何情况下都不会写入 / 删除源照片、源视频。
 # =========================================================
-_GC_CLASSES = ("tmp_leak", "unrecorded", "missing_source", "changed_source")
+_GC_CLASSES = ("tmp_leak", "unrecorded", "missing_source", "changed_source",
+               "obsolete_variant")
 _GC_DESC = {
     "tmp_leak": "中断残留的临时文件（生成/转码未完成）",
     "unrecorded": "清单无记录，且不可能被任何有效源命中",
     "missing_source": "来源文件已从图库中消失",
     "changed_source": "来源文件已改动（mtime/大小变化），旧缓存永久失效",
+    "obsolete_variant": "缩略图旧规格（规格不在当前启用集合内，源仍可达）",
 }
 
 
@@ -3271,6 +3314,23 @@ def _gc_collect(classes=None, force=True, full=None):
     内部实现：把 cache/ 下的文件逐个判定，返回完整明细（不截断）。
     绝不修改 / 删除任何文件。
     force=True 时强制重新遍历磁盘（预览/执行都用它，保证数字是当下真实值）。
+
+    判定顺序（同一条记录只归一类，不重复计数）：
+        ① tmp_leak          文件名含 .tmp
+        ② unrecorded        清单无该行
+        ③ 路径核验失败      记录↔磁盘路径不一致 / 重复映射 / 规格无法解析 → **安全跳过**
+        ④ 保护              图库离线 / 源在回收站 → **安全跳过（优先于一切可删判定）**
+        ⑤ obsolete_variant  缩略图且规格 ∉ 启用集合
+        ⑥ missing_source    源已不存在
+        ⑦ changed_source    源已改动
+
+    ★ ⑤ 排在 ⑥⑦ 之前：一条旧规格记录即使源已消失，归到 obsolete_variant 才能让
+      「统一规格」在 dry-run 里得到一个完整、可对账的总数（否则被拆到三类里，无法核对）。
+    ★ 只有「确属缩略图变体 + 规格可解析 + 不在启用集合」才可能被判 ⑤；
+      规格解析不出（thumb_side_of→None）一律保留并计数，绝不猜删。
+    ★ 判定只依据**清单记录**（variant/kind），绝不解析磁盘文件名反推规格。
+
+    返回 (picked, ghost, protected, tot_files, tot_bytes, empty_dirs, thr, kinds)。
     """
     want = set(classes) if classes else set(_GC_CLASSES)
     files, empty_dirs = _scan_cache(force=force, full=full)
@@ -3278,6 +3338,47 @@ def _gc_collect(classes=None, force=True, full=None):
     if CACHE_INDEX is not None:
         for e in CACHE_INDEX.all_entries():
             entries[e["key"]] = e
+
+    enabled = thumb_enabled_sides()
+
+    # ── 记录级统计（与文件是否存在无关，供 dry-run 逐项对账）──
+    #    thr["bySide"]     : {side: {files, bytes, protected}}（含受保护项，便于逐档核对）
+    #    thr["records"]    : 清单里 thumb 记录总数
+    #    thr["unparsable"] : 规格无法解析的 thumb 记录数（一律保留）
+    thr = {"records": 0, "unparsable": 0, "bySide": {},
+           "protectedByState": {"offline": 0, "trashed": 0},
+           "mismatch": 0, "keepFiles": 0, "keepBytes": 0}
+    kinds = {}
+    for e in entries.values():
+        k = e["kind"]
+        d = kinds.get(k)
+        if d is None:
+            d = kinds[k] = {"records": 0, "bytes": 0}
+        d["records"] += 1
+        d["bytes"] += int(e.get("bytes") or 0)
+        if k == "thumb":
+            thr["records"] += 1
+            if thumb_side_of(e.get("variant")) is None:
+                thr["unparsable"] += 1
+
+    def _bump_side(side, size, protected=False):
+        d = thr["bySide"].setdefault(side, {"files": 0, "bytes": 0, "protected": 0})
+        d["files"] += 1
+        d["bytes"] += size
+        if protected:
+            d["protected"] += 1
+
+    def _norm(p):
+        return os.path.normcase(os.path.abspath(p))
+
+    # 磁盘上「同一 key 出现多次」= 重复映射（正常分片布局下不可能；出现即异常 → 跳过）
+    key_counts = {}
+    for p in files:
+        n = os.path.basename(p)
+        if ".tmp" in n.lower():
+            continue
+        kk = _key_of_cache_name(n)
+        key_counts[kk] = key_counts.get(kk, 0) + 1
 
     state_cache = {}
 
@@ -3307,34 +3408,85 @@ def _gc_collect(classes=None, force=True, full=None):
         state_cache[k] = v
         return v
 
-    items = []          # {path, size, cls, why}；cls=None 表示受保护（保留）
+    items = []          # {path, size, cls, kind, why}；cls=None 表示受保护（保留）
     protected = 0
     for path, size in files.items():
         name = os.path.basename(path)
         if ".tmp" in name.lower():
             items.append({"path": path, "size": size, "cls": "tmp_leak",
-                          "why": "未完成的生成/转码残留"})
+                          "kind": "", "why": "未完成的生成/转码残留"})
             continue
-        e = entries.get(_key_of_cache_name(name))
+
+        key = _key_of_cache_name(name)
+        e = entries.get(key)
         if e is None:
             items.append({"path": path, "size": size, "cls": "unrecorded",
-                          "why": "清单无记录"})
+                          "kind": "", "why": "清单无记录"})
             continue
+
+        # ── ③ 记录 ↔ 磁盘路径 正向核验（不靠文件名猜测；任何不一致一律保留并计数）──
+        if key_counts.get(key, 0) > 1:
+            thr["mismatch"] += 1
+            items.append({"path": path, "size": size, "cls": None, "kind": e["kind"],
+                          "why": f"同一 key 在盘上出现多次（重复映射），保留：{key[:12]}…"})
+            continue
+        if _norm(cache_file_for(key, e["kind"])) != _norm(path):
+            thr["mismatch"] += 1
+            items.append({"path": path, "size": size, "cls": None, "kind": e["kind"],
+                          "why": f"路径与清单推导不符，保留：{key[:12]}…"})
+            continue
+
+        is_thumb = (e["kind"] == "thumb")
+        side = thumb_side_of(e.get("variant")) if is_thumb else None
+        if is_thumb and side is None:
+            # 规格无法解析 → 保留 + 计数，绝不猜删（照片/大图的 variant 不参与本判定）
+            items.append({"path": path, "size": size, "cls": None, "kind": "thumb",
+                          "why": "缩略图规格无法解析，保留"})
+            continue
+        obsolete = is_thumb and side not in enabled
+
+        # ── ④ 保护分支：必须在一切可删判定之前 ──
         stt = src_state(e["lib_id"], e["rel"])
         if stt[0] == "offline":
             protected += 1
-            items.append({"path": path, "size": size, "cls": None,
+            if obsolete:
+                thr["protectedByState"]["offline"] += 1
+                _bump_side(side, size, protected=True)
+            elif is_thumb:
+                thr["keepFiles"] += 1
+                thr["keepBytes"] += size
+            items.append({"path": path, "size": size, "cls": None, "kind": e["kind"],
                           "why": f"图库离线，保留（{e['lib_id']}）"})
-        elif stt[0] == "trashed":
+            continue
+        if stt[0] == "trashed":
             protected += 1
-            items.append({"path": path, "size": size, "cls": None,
+            if obsolete:
+                thr["protectedByState"]["trashed"] += 1
+                _bump_side(side, size, protected=True)
+            elif is_thumb:
+                thr["keepFiles"] += 1
+                thr["keepBytes"] += size
+            items.append({"path": path, "size": size, "cls": None, "kind": e["kind"],
                           "why": f"源在回收站，保留（{e['lib_id']}/{e['rel']}）"})
-        elif stt[0] == "gone":
+            continue
+
+        # ── ⑤ 旧规格缩略图（优先于 gone/changed，保证「统一规格」总数完整可对账）──
+        if obsolete:
+            _bump_side(side, size)
+            items.append({"path": path, "size": size, "cls": "obsolete_variant",
+                          "kind": "thumb",
+                          "why": f"缩略图旧规格 s={side}（当前启用 {sorted(enabled)}）"})
+            continue
+
+        if stt[0] == "gone":
             items.append({"path": path, "size": size, "cls": "missing_source",
-                          "why": f"源已不存在：{e['lib_id']}/{e['rel']}"})
+                          "kind": e["kind"], "why": f"源已不存在：{e['lib_id']}/{e['rel']}"})
         elif (stt[1] != e["src_mtime"]) or (int(stt[2]) != int(e["src_size"])):
             items.append({"path": path, "size": size, "cls": "changed_source",
-                          "why": f"源已改动：{e['lib_id']}/{e['rel']}"})
+                          "kind": e["kind"], "why": f"源已改动：{e['lib_id']}/{e['rel']}"})
+        elif is_thumb and side in enabled:
+            thr["keepFiles"] += 1
+            thr["keepBytes"] += size
 
     # 清单里存在、但盘上没有对应文件的「幽灵行」
     ghost = []
@@ -3345,34 +3497,56 @@ def _gc_collect(classes=None, force=True, full=None):
 
     # 过滤出用户要求的类别
     picked = [it for it in items if it["cls"] and it["cls"] in want]
-    return picked, ghost, protected, len(files), sum(files.values()), len(empty_dirs)
+    return (picked, ghost, protected, len(files), sum(files.values()),
+            len(empty_dirs), thr, kinds)
 
 
 def cache_gc_plan(classes=None, force=True, full=None):
-    """只读预览：预计可删除的孤儿缓存数量与空间。不删任何文件。"""
-    picked, ghost, protected, tot_files, tot_bytes, empty_dirs = \
-        _gc_collect(classes, force, full)
+    """只读预览：预计可删除的孤儿缓存数量与空间。不删任何文件。
+
+    ★ 唯一写入的「副作用」是记录扫描时间戳（cache.db 的 meta 表）—— 用于让后续
+      剪枝扫描更快；不碰 entries、不碰任何缓存/照片/索引文件。
+    """
+    (picked, ghost, protected, tot_files, tot_bytes, empty_dirs,
+     thr, kinds) = _gc_collect(classes, force, full)
     by_class = []
     for cls in _GC_CLASSES:
         sub = [it for it in picked if it["cls"] == cls]
-        if not sub:
+        # 旧规格类别即便为 0 也照样输出 —— 让「统一规格」的对账结果始终可见
+        if not sub and cls != "obsolete_variant":
             continue
         sample = [{
             "p": os.path.relpath(it["path"], APP_DIR).replace("\\", "/"),
             "kb": round(it["size"] / 1024, 1), "why": it["why"]}
             for it in sorted(sub, key=lambda x: -x["size"])[:10]]
-        by_class.append({"cls": cls, "desc": _GC_DESC[cls],
-                         "files": len(sub),
-                         "bytes": sum(it["size"] for it in sub),
-                         "sample": sample})
+        row = {"cls": cls, "desc": _GC_DESC[cls],
+               "files": len(sub),
+               "bytes": sum(it["size"] for it in sub),
+               "sample": sample}
+        if cls == "obsolete_variant":
+            sides = sorted(thr["bySide"].items(), key=lambda kv: -int(kv[0]))
+            row["enabledSides"] = sorted(thumb_enabled_sides())
+            row["candidates"] = sum(v["files"] for v in thr["bySide"].values())
+            row["bySide"] = [{"side": int(s), "files": v["files"],
+                              "bytes": v["bytes"], "protected": v["protected"]}
+                             for s, v in sides]
+            row["protectedByState"] = dict(thr["protectedByState"])
+            row["unparsable"] = thr["unparsable"]
+            row["mismatch"] = thr["mismatch"]
+            row["keep"] = {"files": thr["keepFiles"], "bytes": thr["keepBytes"]}
+        by_class.append(row)
     o_files = len(picked)
     o_bytes = sum(it["size"] for it in picked)
+    # 安全断言：photo / trans 记录绝不允许出现在任何可删类别里（预期恒为 0）
+    bad = [it for it in picked if it.get("kind") in ("photo", "trans")]
     return {
         "cache": {"files": tot_files, "bytes": tot_bytes},
         "orphan": {"files": o_files, "bytes": o_bytes},
         "keep": {"files": tot_files - o_files, "bytes": tot_bytes - o_bytes,
                  "protectedOffline": protected},
         "byClass": by_class,
+        "kinds": kinds,
+        "safety": {"photoTransInDeletable": len(bad)},
         "ghostRows": len(ghost),
         "emptyDirs": empty_dirs,
         "allClasses": list(_GC_CLASSES),
@@ -3384,11 +3558,30 @@ def cache_gc_apply(classes=None, full=None):
     """
     执行清理：**只删除 cache/ 目录内的孤儿缓存文件**。
     每一处删除前都做 realpath 前缀双校验；源照片目录永远不在删除范围内。
-    返回 {deleted, bytes, ghostRows, errors}。
+
+    ★ 二次核验：本函数**不读取** dry-run 留下的任何候选清单，而是以 force=True
+      现场重扫（磁盘 + 清单 + src_state）得到全新候选集；删除前再逐条复核
+      「清单行仍在 / 规格仍属过时 / 文件仍在且大小未变」，任一变化即跳过。
+      因此 dry-run 与实际删除之间的数据漂移不会导致误删。
+    返回 {deleted, bytes, ghostRows, emptyDirs, skipped, errors}。
     """
-    picked, ghost, _protected, _tf, _tb, _ed = _gc_collect(classes, True, full)
+    (picked, ghost, _protected, _tf, _tb, _ed, _thr, _kinds) = \
+        _gc_collect(classes, True, full)
+
+    enabled = thumb_enabled_sides()
+    live = {}
+    if CACHE_INDEX is not None:
+        try:
+            for e in CACHE_INDEX.all_entries():
+                live[e["key"]] = e
+        except Exception as e:
+            log.error("cache gc apply: 清单读取失败，已中止（未删除任何文件）: %s", e)
+            return {"deleted": 0, "bytes": 0, "ghostRows": 0, "emptyDirs": 0,
+                    "skipped": 0, "errors": [f"清单读取失败，未删除任何文件: {e}"],
+                    "modes": {"dry": False}}
+
     cache_root = os.path.realpath(CACHE_DIR) + os.sep
-    deleted = freed = 0
+    deleted = freed = skipped = 0
     errors = []
     removed_keys = []
     for it in picked:
@@ -3403,16 +3596,49 @@ def cache_gc_apply(classes=None, full=None):
             if not os.path.isfile(rp) or os.path.islink(p):
                 errors.append(f"非常规文件，跳过: {p}")
                 continue
+            # ── 安全闸门 3：二次核验（防 dry-run → 删除之间的数据漂移）──
+            #    只核验「与该类别语义相关」的那些属性，逐类判断：
+            key = _key_of_cache_name(os.path.basename(p))
+            cls = it["cls"]
+            e = live.get(key)
+            if cls == "obsolete_variant":
+                # 必须仍是 thumb、规格仍不在启用集合、且文件大小未变
+                if e is None or e["kind"] != "thumb":
+                    skipped += 1
+                    errors.append(f"清单行已消失/类型已变，跳过: {p}")
+                    continue
+                side = thumb_side_of(e.get("variant"))
+                if side is None or side in enabled:
+                    skipped += 1
+                    errors.append(f"规格已不再过时，跳过: {p}")
+                    continue
+                if os.path.getsize(rp) != it["size"]:
+                    skipped += 1
+                    errors.append(f"文件大小已变化，跳过: {p}")
+                    continue
+            elif cls == "unrecorded":
+                # 盘上有、清单没有；若此刻已被纳管（adopt / 刚生成）→ 不再删
+                if e is not None:
+                    skipped += 1
+                    errors.append(f"该文件已被重新纳管，跳过: {p}")
+                    continue
+            elif cls in ("missing_source", "changed_source"):
+                # 判据来自清单行；行若消失则无从复核 → 跳过
+                if e is None:
+                    skipped += 1
+                    errors.append(f"清单行已消失，跳过: {p}")
+                    continue
+            # tmp_leak：文件名即判据，无需核验
             sz = os.path.getsize(rp)
             os.remove(rp)
             deleted += 1
             freed += sz
-            k = _key_of_cache_name(os.path.basename(p))
             if CACHE_INDEX is not None:
-                removed_keys.append(k)
+                removed_keys.append(key)
                 with _recorded_memo_lock:
-                    _recorded_memo.discard(k)
+                    _recorded_memo.discard(key)
         except FileNotFoundError:
+            skipped += 1
             continue
         except Exception as e:
             errors.append(f"{p}: {e}")
@@ -3443,6 +3669,7 @@ def cache_gc_apply(classes=None, full=None):
     _scan_cache_invalidate()                          # 文件已变，作废列表缓存
     return {"deleted": deleted, "bytes": freed,
             "ghostRows": ghost_removed, "emptyDirs": empty_dirs,
+            "skipped": skipped,
             "errors": errors[:20],
             "modes": {"dry": False}}
 
@@ -4511,7 +4738,7 @@ class Handler(BaseHTTPRequestHandler):
         it, fp, code, msg = self._resolve_trash(qs)
         if code:
             return self.send_err(code, msg)
-        side = pick_thumb((qs.get("s") or ["320"])[0])
+        side = pick_thumb((qs.get("s") or [str(THUMB_DEFAULT)])[0])
         lib = META["libs"].get(it["lib_id"]) or {"id": it["lib_id"], "name": ""}
         try:
             st = os.stat(fp)
@@ -4744,10 +4971,16 @@ class Handler(BaseHTTPRequestHandler):
         """
         缓存回收。默认**只预览**（dry），必须显式 ?apply=1 才真正删除。
           ?apply=1            执行清理
-          ?cls=a,b            只处理指定类别（tmp_leak/unrecorded/missing_source/changed_source）
+          ?cls=a,b            只处理指定类别
+                              （tmp_leak / unrecorded / missing_source /
+                                changed_source / obsolete_variant）
           ?adopt=1            先收养既有缓存再判定
           ?full=1             深度全量扫描（能发现清单外、目录又没被动过的历史遗留文件；慢）
         删除范围严格限制在 cache/ 目录内，绝不触碰源照片。
+
+        ★ 统一缩略图规格时建议单独执行 `?cls=obsolete_variant`，便于逐档对账；
+          dry-run 的 byClass[obsolete_variant] 会给出 bySide / protectedByState /
+          mismatch / unparsable，核对无误后再加 ?apply=1。
 
         ★ 本接口**有副作用**（可删缓存文件），因此不再是匿名可调：
           必须带有效管理会话 + X-SL-Admin 头（与 /api/refresh 一致）。
@@ -4761,12 +4994,17 @@ class Handler(BaseHTTPRequestHandler):
             cache_adopt()
         raw = (qs.get("cls") or [""])[0].strip()
         classes = [c for c in raw.split(",") if c in _GC_CLASSES] or None
+        # ★ 类别名写错绝不等于「全部」：宁可报错，也不要把一次笔误变成全量删除。
+        if raw and not classes:
+            return self.send_mgmt_err(
+                400, f"未知缓存类别：{raw}（可用：{'/'.join(_GC_CLASSES)}）")
         deep = True if (qs.get("full") or ["0"])[0] == "1" else None
         if (qs.get("apply") or ["0"])[0] == "1":
             res = cache_gc_apply(classes, deep)
-            log.info("cache gc: 删除 %s 个文件 / %.2f MB（类别 %s%s）",
+            log.info("cache gc: 删除 %s 个文件 / %.2f MB（跳过 %s，类别 %s%s）",
                      res["deleted"], res["bytes"] / 1048576,
-                     classes or "全部", "，深度扫描" if deep else "")
+                     res.get("skipped", 0), classes or "全部",
+                     "，深度扫描" if deep else "")
             return self.send_json(res)
         return self.send_json(cache_gc_plan(classes, True, deep))
 
@@ -4833,7 +5071,8 @@ class Handler(BaseHTTPRequestHandler):
         if fmt not in ("webp", "jpeg"):
             fmt = "webp"
         if kind == "thumb":
-            side, quality = pick_thumb((qs.get("s") or ["320"])[0]), THUMB_QUALITY
+            side, quality = (pick_thumb((qs.get("s") or [str(THUMB_DEFAULT)])[0]),
+                             THUMB_QUALITY)
             fmt = "webp"                       # 缩略图永远用 webp
         else:
             side, quality = PHOTO_MAX, PHOTO_QUALITY
