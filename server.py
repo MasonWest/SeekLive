@@ -214,8 +214,14 @@ for _e, _t in ((".heic", "image/heic"), (".heics", "image/heic"), (".heif", "ima
 # =========================================================
 META = {"libs": {}, "lib_order": [],
         "scan": dict(DEFAULT_SCAN), "trash": dict(DEFAULT_TRASH)}
-PID_FILE = os.path.join(APP_DIR, "server.pid")
-PORT_FILE = os.path.join(APP_DIR, "server.port")
+# 运行标记文件（server.pid / server.port）。
+# ★ 这两个名字是**全局唯一**的：任何第二个实例都会覆盖它，而 `--stop` 正是照着它
+#   精确杀进程 —— 所以「测试实例」和「开发者正在跑的真实服务」会互相踩：
+#   测试在起自己的实例前先跑一次 `--stop`，就会把真实服务一起杀掉。
+#   要起自己的进程树（例如测试）时给一个前缀即可，两边各用各的标记文件。
+_STATE_PREFIX = os.environ.get("SEEKLIVE_STATE_PREFIX", "").strip()
+PID_FILE = os.path.join(APP_DIR, _STATE_PREFIX + "server.pid")
+PORT_FILE = os.path.join(APP_DIR, _STATE_PREFIX + "server.port")
 
 INDEX = None                       # index_db.Index 实例（启动时打开）
 INDEX_LOCK = threading.RLock()     # 串行化「扫描 → 交换内存索引」

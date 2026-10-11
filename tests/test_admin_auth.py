@@ -38,6 +38,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.dirname(HERE)
 PY = sys.executable
 ADMIN_JSON = os.path.join(APP, "admin.json")
+REAL_PID = os.path.join(APP, "server.pid")
+# ★ 本套件会拉起**真实的 server.py 子进程**，而 server.pid / server.port 是全局唯一的：
+#   不隔离的话，测试实例会覆盖真实服务的标记文件，更糟的是 `--stop` 会照着 pid 文件
+#   把开发者正在跑的服务一起杀掉。给它一个前缀，两边各用各的（server.py 里读它）。
+CHILD_ENV = dict(os.environ, SEEKLIVE_STATE_PREFIX="test_")
+
+
+def real_pid_snapshot():
+    """真实服务的 server.pid 内容（不存在 → None）。用于断言测试没碰它。"""
+    try:
+        with open(REAL_PID, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
 LOG_FILE = os.path.join(APP, "logs", "server.log")
 
 PASS = FAIL = 0
@@ -118,8 +132,9 @@ class Srv:
         return f"http://127.0.0.1:{self.port}"
 
     def _stop_running(self):
+        # env 必须带前缀：否则 --stop 读的是**真实服务**的 pid 文件，会把人家杀掉
         subprocess.run([PY, "server.py", "--stop"], cwd=APP,
-                       capture_output=True, timeout=30)
+                       capture_output=True, timeout=30, env=CHILD_ENV)
         time.sleep(1.2)
         self._kill_port_squatter()
 
@@ -160,7 +175,8 @@ class Srv:
         args = [PY, "-u", "server.py", "--port", str(self.port), "--no-recheck"]
         args += self.extra_args
         fh = open(self.out, "wb")
-        self.proc = subprocess.Popen(args, cwd=APP, stdout=fh, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(args, cwd=APP, stdout=fh,
+                                     stderr=subprocess.STDOUT, env=CHILD_ENV)
         deadline = time.time() + 40
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -248,6 +264,8 @@ def main():
     if os.path.isfile(ADMIN_JSON):
         backup = ADMIN_JSON + ".testbak"
         shutil.move(ADMIN_JSON, backup)
+
+    real_pid_before = real_pid_snapshot()      # 隔离回归：跑完必须一字未改
 
     pw = "Zq7-" + secrets.token_hex(4)          # 用于日志脱敏断言的独特口令
     other = "Zq7-" + secrets.token_hex(4)
@@ -614,6 +632,16 @@ def main():
         s4.stop()
         s2.stop()
         s.stop()
+
+        # ---------------------------------------------------------
+        sect("组 8 · 实例隔离：不能碰到开发者正在跑的真实服务")
+        # ---------------------------------------------------------
+        after = real_pid_snapshot()
+        chk("测试全程未改写真实服务的 server.pid",
+            after == real_pid_before, f"前={real_pid_before!r} 后={after!r}")
+        chk("测试自己的运行标记带 test_ 前缀（各用各的）",
+            CHILD_ENV.get("SEEKLIVE_STATE_PREFIX") == "test_",
+            str(CHILD_ENV.get("SEEKLIVE_STATE_PREFIX")))
 
     finally:
         cleanup_admin_json(backup)
