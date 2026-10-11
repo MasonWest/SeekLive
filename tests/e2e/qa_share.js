@@ -11,6 +11,8 @@
  *   1) 未授权访客：只有壳，看不到任何照片；数据接口 401
  *   2) 管理员：口令授权后一切正常（管理入口可见）
  *   3) 整月「全选本月」→ 生成分享链接
+ *   3b) 日期标题后的选择框：整日选中 / 手动取消一张变半选 / 补齐 / 整天取消，
+ *       且只在选择模式出现
  *   4) 分享访客（全新无 Cookie 上下文）：只见授权集合、管理入口全隐藏、
  *      未授权照片 403、分享媒体带 private, no-store
  *   5) 撤销后：分享页立即失效（先直接问服务端，再刷新页面；含 keep-alive
@@ -142,6 +144,60 @@ const visible = (page, sel) => page.evaluate(
     ok(/^https?:\/\/.+\/s\/[A-Za-z0-9_-]{16,}$/.test(shareUrl), '生成了高随机令牌的分享链接', shareUrl);
     await anon.click('#cfmYes');                       // 关闭「已生成」对话框
     await sleep(300);
+
+    /* ---------------- 3b) 日期标题后的选择框 ---------------- */
+    sect('3b · 日期标题后的选择框：整日选中 / 半选 / 取消');
+    const dayPickVisible = () => anon.locator('.day-blk .d-pick').first().isVisible();
+    ok(!(await dayPickVisible()), '浏览模式下日期选择框不出现（避免误触）');
+
+    await anon.click('#btnSelect');
+    await anon.waitForSelector('#selBar:not([hidden])', { timeout: 6000 });
+    ok(await dayPickVisible(), '进入选择模式后，日期标题后出现选择框');
+    ok(await visible(anon, '#selMonth'), '「全选本月」仍在（两个入口共存）');
+
+    // 夹具里最老的那一天有 2 张，用它验证「半选」
+    const lastDay = anon.locator('.day-blk').last();
+    await lastDay.scrollIntoViewIfNeeded();
+    await anon.waitForFunction(() => {
+      const all = document.querySelectorAll('.day-blk');
+      const last = all[all.length - 1];
+      return !!last && last.querySelectorAll('.tile:not(.sk)').length >= 2;
+    }, null, { timeout: 15000 });
+    const dayTotal = +(await lastDay.getAttribute('data-total'));
+    ok(dayTotal === 2, '夹具最老一天有 2 张（用于验证半选）', 'data-total=' + dayTotal);
+
+    const dayCb = lastDay.locator('.d-pick-cb');
+    await dayCb.click();                                  // ① 整日选中
+    await anon.waitForFunction(
+      () => /已选\s*2\s*项/.test(document.querySelector('#selCount').textContent),
+      null, { timeout: 12000 });
+    ok(await dayCb.isChecked(), '勾选日期选择框 → 这一天 2 张全部选中');
+    ok((await lastDay.locator('.tile.sel').count()) === 2, '这一天 2 张都高亮了');
+
+    await lastDay.locator('.tile').first().click();        // ② 取消一张 → 半选
+    await anon.waitForFunction(
+      () => /已选\s*1\s*项/.test(document.querySelector('#selCount').textContent),
+      null, { timeout: 10000 });
+    ok((await dayCb.evaluate(el => el.indeterminate)) === true,
+      '手动取消一张后，日期选择框变为「半选」（indeterminate）');
+
+    await dayCb.click();                                  // ③ 半选点一下 → 补齐
+    await anon.waitForFunction(
+      () => /已选\s*2\s*项/.test(document.querySelector('#selCount').textContent),
+      null, { timeout: 10000 });
+    ok(await dayCb.isChecked(), '半选状态再点一次 → 补齐为整日全选');
+
+    await dayCb.click();                                  // ④ 再点一下 → 取消整天
+    await anon.waitForFunction(
+      () => /已选\s*0\s*项/.test(document.querySelector('#selCount').textContent),
+      null, { timeout: 10000 });
+    ok(!(await dayCb.isChecked()) && !(await dayCb.evaluate(el => el.indeterminate)),
+      '再点一次 → 整天取消，回到未选');
+
+    await anon.click('#selCancel');
+    await anon.waitForFunction(
+      () => document.querySelector('#selBar').hidden, null, { timeout: 5000 });
+    ok(!(await dayPickVisible()), '退出选择模式后日期选择框隐藏');
 
     /* ---------------- 4) 分享访客 ---------------- */
     sect('4 · 分享访客（全新无 Cookie）：只见授权集合');

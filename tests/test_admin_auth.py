@@ -600,10 +600,12 @@ def main():
         chk("logs/server.log 不含任何测试口令", not hit, "命中=" + (",".join(hit) or "无"))
         chk("访问日志里的登录请求只有路径、无凭据",
             "/api/admin/login" not in logtxt or pwA not in logtxt)
-        st, _, raw = request(s6.base + "/api/admin/status")
+        # 注意：本套件的服务实例由 PID 文件守卫「同一时刻只允许一个」，
+        # 所以启动 s7 之后 s6 一定已经下线 —— 这里必须问**当前活着**的 s7。
+        st, _, raw = request(s7.base + "/api/admin/status")
         body = raw.decode("utf-8", "ignore")
         chk("/api/admin/status 不泄露口令、不泄露 sid",
-            pwA not in body and "sl_admin=" not in body)
+            pwA not in body and pwB not in body and "sl_admin=" not in body)
 
         # 收尾：停掉最后一个实例
         s7.stop()

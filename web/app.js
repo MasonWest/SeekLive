@@ -360,6 +360,7 @@ function renderNextBatch() {
   tl.appendChild(frag);
   sizeSkeletons(created);                     // ★ 骨架撑到真实高度
   state.renderedDayIdx = to;
+  if (sel.active) syncDayPicks(created);      // 选择模式下新渲染的分组要接上勾选态
 
   if (to >= state.days.length) {
     state.done = true;
@@ -394,6 +395,8 @@ function makeDayBlock(day) {
   el.innerHTML =
     `<div class="day-hd"><span>${fmtDayHead(day.ym, day.d)}</span>` +
     `<span class="d-n">${total != null ? total + ' 张' : ''}</span>` +
+    `<label class="d-pick" title="选中 / 取消这一天的全部照片">` +
+    `<input type="checkbox" class="d-pick-cb" aria-label="选中这一天"></label>` +
     `<span class="d-w">${weekdayOf(day.ym, day.d)}</span></div>` +
     `<div class="grid">${sk}</div>`;
   groupObserver.observe(el);
@@ -1706,6 +1709,7 @@ function syncSelBar() {
   $('#selDelete').disabled = n === 0;
   const sh = $('#selShare');
   if (sh) sh.disabled = n === 0;
+  syncDayPicks();            // 每天标题后的选择框跟着勾选态走（含半选）
 }
 function toggleSelectMode(on) {
   sel.active = !!on;
@@ -1723,6 +1727,78 @@ $('#btnSelect').onclick = () => {
   toggleSelectMode(!sel.active);
 };
 $('#selCancel').onclick = () => toggleSelectMode(false);
+
+/* ---------------- 「每一天」整日选择框 ----------------
+   只在选择模式（body.selecting）下出现：点一下 = 选中 / 取消这一天**全部**照片，
+   部分选中时显示为半选。与「全选本月」共用同一个 sel.map，两者可以叠加使用。
+   ★ 单日也可能超过 600 张，所以同样按 600/页 分页拉全，避免漏选。 */
+function dayKeyOfItem(it) {
+  if (!it || !it.t) return '';
+  const dt = new Date(it.t * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}|${p(dt.getDate())}`;
+}
+function selCountByDay() {
+  const m = new Map();
+  for (const it of sel.map.values()) {
+    const k = dayKeyOfItem(it);
+    if (k) m.set(k, (m.get(k) || 0) + 1);
+  }
+  return m;
+}
+function syncDayPicks(blocks) {
+  const list = blocks || $$('.day-blk');
+  if (!list.length) return;
+  const byDay = selCountByDay();
+  for (const el of list) {
+    const cb = el.querySelector('.d-pick-cb');
+    if (!cb) continue;
+    const n = byDay.get(el.dataset.key) || 0;
+    const total = +el.dataset.total || 0;
+    cb.checked = n > 0 && total > 0 && n >= total;
+    cb.indeterminate = n > 0 && !cb.checked;
+  }
+}
+async function pickDay(el, on) {
+  if (!el || !sel.active) return;
+  const cb = el.querySelector('.d-pick-cb');
+  const ym = el.dataset.ym, d = el.dataset.d;
+  if (cb) cb.disabled = true;
+  try {
+    const items = [];
+    let off = 0, total = 1;
+    while (off < total) {
+      const r = await api('/api/items', { lib: state.lib, ym, d, off, lim: 600 });
+      const arr = r.items || [];
+      total = r.total || 0;
+      for (const it of arr) items.push(it);
+      off += arr.length;
+      if (!arr.length) break;
+    }
+    if (!items.length) { toast('这一天没有可选的条目', 2600); return; }
+    if (on) { for (const it of items) if (!sel.map.has(it.p)) sel.map.set(it.p, it); }
+    else { for (const it of items) sel.map.delete(it.p); }
+    if (!el.dataset.total) el.dataset.total = items.length;   // 供半选判定
+    // 已渲染的格子同步高亮（未渲染的仍在选择集里，创建分享时会一并带上）
+    $$('.tile').forEach(a => {
+      const it = tileItemOf(a);
+      a.classList.toggle('sel', !!(it && sel.map.has(it.p)));
+    });
+    const label = fmtDayHead(ym, d);
+    toast(on ? `已选中 ${label}，共 ${sel.map.size} 项` : `已取消 ${label}`, 3000);
+    syncSelBar();
+  } catch (e) {
+    toast('选取当天失败：' + e.message, 4200);
+  } finally {
+    if (cb) cb.disabled = false;
+    syncDayPicks([el]);
+  }
+}
+document.addEventListener('change', e => {
+  const cb = e.target && e.target.closest ? e.target.closest('.d-pick-cb') : null;
+  if (!cb) return;
+  pickDay(cb.closest('.day-blk'), cb.checked);
+});
 
 /* =====================================================
    免登录分享（管理端创建 / 撤销；访客只读）
@@ -1791,7 +1867,9 @@ $('#selShare').onclick = async () => {
                <option value="90">90 天</option>
              </select></label>
            <div class="aa-hint">分享内容在创建的这一刻就固化了：之后你在相册里新增或删除照片，
-             都不会改变这条分享的范围。</div>`,
+             都不会改变这条分享的范围。</div>
+           ${sess.publicUrl ? `<div class="aa-hint">链接地址将使用
+             <b>${esc(sess.publicUrl)}</b>（admin.json → publicUrl）</div>` : ''}`,
   });
   if (!ok) return;
   const title = (($('#shTitle') || {}).value || '').trim();
@@ -1800,13 +1878,15 @@ $('#selShare').onclick = async () => {
     const r = await apiPost('/api/share/create',
       { lib: state.lib, rels, title, expireDays: days, kind: 'items' });
     toggleSelectMode(false);
-    showShareResult(location.origin + r.url, r.share, r.skipped);
+    // ★ 配了 publicUrl 就用服务端给的绝对地址，否则退回当前页面地址
+    showShareResult(r.fullUrl || (location.origin + r.url),
+                    r.share, r.skipped, !!r.fullUrl);
   } catch (e) {
     toast('生成分享失败：' + e.message, 4600);
   }
 };
 
-function showShareResult(url, meta, skipped) {
+function showShareResult(url, meta, skipped, usedPublic) {
   const skip = (skipped && skipped.length)
     ? `<div class="aa-hint">有 ${skipped.length} 张不在索引里，已自动跳过。</div>` : '';
   askConfirm({
@@ -1818,7 +1898,8 @@ function showShareResult(url, meta, skipped) {
            <div class="sh-link" id="shUrl">${esc(url)}</div>
            <button class="cfm-btn" id="shCopy" style="margin-top:10px">复制链接</button>
            <div class="aa-hint">把这条链接发给对方即可（对方无需登录）。
-             随时可在「分享管理」里撤销，撤销后立即失效。${skip}</div>`,
+             随时可在「分享管理」里撤销，撤销后立即失效。${skip}</div>
+           ${usedPublic ? '<div class="aa-hint">已使用 admin.json 里的 publicUrl 替换本机地址。</div>' : ''}`,
   });
   const b = $('#shCopy');
   if (b) b.onclick = async () => {

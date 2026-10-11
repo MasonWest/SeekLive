@@ -4,5 +4,8 @@
 
   "adminToken": "改成你自己的口令",
   "sessionHours": 12,
-  "sessionCookieMaxAge": 0
+  "sessionCookieMaxAge": 0,
+
+  "publicUrl": "",
+  "_publicUrl": "（可选）对外访问地址，例如 https://photos.example.com 或 http://192.168.1.9:9000。填写后，生成的分享链接会用它替换 http://127.0.0.1:9000，复制出去就能直接发给别人。留空则使用打开页面时的地址。"
 }

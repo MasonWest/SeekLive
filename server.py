@@ -227,7 +227,7 @@ _purge_stop = threading.Event()     # 回收站到期检查线程的停止信号
 #  口令本体只存在于内存，不落盘、不回显、不进日志、不进 URL。
 # =========================================================
 ADMIN_CFG_PATH = os.path.join(APP_DIR, "admin.json")
-ADMIN_CFG = {"sessionHours": 12.0, "sessionCookieMaxAge": 0}
+ADMIN_CFG = {"sessionHours": 12.0, "sessionCookieMaxAge": 0, "publicUrl": ""}
 ADMIN_PW = None                     # 管理口令本体（仅内存）
 ADMIN_SOURCE = ""                   # 口令来源："命令行" / "admin.json"
 SESSION_COOKIE = "sl_admin"
@@ -1655,6 +1655,22 @@ def load_admin_cfg():
         return {}
 
 
+def norm_public_url(v):
+    """
+    归一化 admin.json 里的 `publicUrl`：去掉首尾空白与尾斜杠；
+    没写协议就补 `https://`（公网入口几乎都是 https）。
+
+    作用只有一个：生成分享链接时把 `http://127.0.0.1:9000/...` 换成这个前缀，
+    让复制出去的链接直接可以发给别人。**它不参与任何权限判断**。
+    """
+    s = str(v or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if not re.match(r"^https?://", s, re.I):
+        s = "https://" + s
+    return s
+
+
 def set_admin_config(cli_token=None):
     """
     确定管理口令（优先级：命令行 --admin-token / --token > admin.json）。
@@ -1676,6 +1692,8 @@ def set_admin_config(cli_token=None):
         maxage = 0
     ADMIN_CFG["sessionHours"] = hours
     ADMIN_CFG["sessionCookieMaxAge"] = max(0, maxage)
+    # publicUrl：仅用于把分享链接里的本机地址换成公网地址（不参与鉴权）
+    ADMIN_CFG["publicUrl"] = norm_public_url(cfg.get("publicUrl"))
 
     tok = str(cli_token or "").strip()
     src = "命令行"
@@ -3568,6 +3586,16 @@ def share_public(rec, lib=None):
     }
 
 
+def share_abs_url(tok):
+    """
+    分享链接的**绝对**地址：配了 publicUrl 就用它，否则返回空串
+    （由前端用 location.origin 兜底）。这样本机开发、局域网、公网三种场景
+    复制出来的链接都是「对方点开就能用」的那一条。
+    """
+    base = ADMIN_CFG.get("publicUrl") or ""
+    return f"{base}/s/{tok}" if base else ""
+
+
 def share_lib_view(lib, rec):
     """
     按授权集合在**内存索引**上重建一个「虚拟图库」（结构同 index_db.build_index）。
@@ -4022,6 +4050,8 @@ class Handler(BaseHTTPRequestHandler):
                "adminRequired": admin_required(),
                "shareEnabled": bool(ACCESS_CFG.get("shareEnabled")),
                "canManage": scope == "admin",
+               # 分享链接要用的对外前缀（admin.json → publicUrl）；空 = 用当前页面地址
+               "publicUrl": ADMIN_CFG.get("publicUrl") or "",
                "admin": {"authed": scope == "admin",
                          "expiresAt": (admin_session_expires(self.admin_sid()) or 0)
                                       if scope == "admin" else 0,
@@ -4126,7 +4156,8 @@ class Handler(BaseHTTPRequestHandler):
         log.info("分享已创建：%s（%d 张，%s）", rec["share_id"], rec["n_items"],
                  "不过期" if not expires_at else f"{days} 天后过期")
         return self.send_json({"ok": True, "share": share_public(rec, lib),
-                               "token": tok, "url": f"/s/{tok}", "skipped": missing})
+                               "token": tok, "url": f"/s/{tok}",
+                               "fullUrl": share_abs_url(tok), "skipped": missing})
 
     def api_share_list(self):
         """POST /api/share/list {lib?} —— 只回元信息，**绝不回显令牌**。"""
@@ -5148,6 +5179,9 @@ def main():
     else:
         print("  源文件管理 : 未配置 → 删除功能关闭（浏览不受影响）")
         print("              如需开启：python server.py --admin-token 你的口令")
+    if ADMIN_CFG.get("publicUrl"):
+        print(f"  分享链接   : {ADMIN_CFG['publicUrl']}/s/<令牌>"
+              f"（admin.json → publicUrl）")
     if ACCESS_PROTECT:
         print("  访问控制   : 已开启（默认拒绝）")
         print("              本机 / 局域网 / 公网**同一规则**：需管理授权或分享链接；")

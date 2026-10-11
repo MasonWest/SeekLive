@@ -204,6 +204,19 @@ main{padding-bottom:calc(var(--safe-b) + 90px)}
 .day-hd .d-n{color:var(--fg-3);font-size:12px;font-weight:450}
 .day-hd .d-w{color:var(--fg-3);font-size:12px;font-weight:450;margin-left:auto}
 
+/* 「每一天」整日选择框：只在选择模式出现（避免浏览时误触） */
+.day-hd .d-pick{
+  display:none;align-self:center;
+  margin-left:2px;padding:4px 6px;border-radius:8px;
+  cursor:pointer;line-height:0;
+}
+body.selecting .day-hd .d-pick{display:inline-flex;align-items:center}
+.day-hd .d-pick-cb{
+  width:17px;height:17px;margin:0;cursor:pointer;
+  accent-color:var(--brand);flex:none;
+}
+.day-hd .d-pick-cb:disabled{opacity:.5;cursor:default}
+
 .grid{
   display:grid;gap:var(--gap);
   grid-template-columns:repeat(var(--cols),1fr);

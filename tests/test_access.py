@@ -195,6 +195,10 @@ def setup_fixture(tmp, token="test-pw-123"):
         ("2024-10/IMG_0004.JPG", ts(2024, 10, 1), "img", 0, None),
         ("2024-10/IMG_0005.JPG", ts(2024, 10, 2), "img", 0, None),
         ("2024-10/IMG_0006.MOV", ts(2024, 10, 3), "vid", 0, None),
+        # 单独留一个「一天多张」的日子（放在**最老的月份**，不影响上面两个
+        # 各含 3 张的月份）—— 供 E2E 验证每天选择框的「半选」状态。
+        ("2024-08/IMG_0007.JPG", ts(2024, 8, 30), "img", 0, None),
+        ("2024-08/IMG_0008.JPG", ts(2024, 8, 30), "img", 0, None),
     ]
     specsB = [("x/IMG_9001.JPG", ts(2024, 8, 1), "img", 0, None)]
     server.META["libs"] = {
@@ -551,6 +555,57 @@ def run_matrix(base):
         chk("keep-alive ⑤（撤销后）同一连接 → 401", s == 401, f"HTTP {s}")
     finally:
         conn.close()
+
+    # =========================================================
+    sect("组 3b · 分享链接的对外地址（admin.json → publicUrl）")
+    # =========================================================
+    # publicUrl 只影响「复制出去的链接长什么样」，**不参与任何权限判断**。
+    for raw_v, want in (("  https://photos.example.com/  ", "https://photos.example.com"),
+                        ("photos.example.com", "https://photos.example.com"),
+                        ("http://192.168.1.9:9000/", "http://192.168.1.9:9000"),
+                        ("", ""), (None, "")):
+        got = server.norm_public_url(raw_v)
+        chk(f"归一化 publicUrl {raw_v!r} → {want!r}", got == want, f"got {got!r}")
+
+    old_pub = server.ADMIN_CFG.get("publicUrl")
+    server.ADMIN_CFG["publicUrl"] = "https://photos.example.com"
+    st, _, raw = req(base, "/api/share/create", "POST",
+                     {"lib": "t", "rels": [R[0]], "title": "PUBURL"},
+                     {"X-SL-Admin": "1"}, ck_admin)
+    d = jbody(raw)
+    tok2 = d.get("token") or ""
+    chk("配了 publicUrl → fullUrl 用对外地址、url 仍是相对路径",
+        st == 200 and d.get("fullUrl") == f"https://photos.example.com/s/{tok2}"
+        and d.get("url") == f"/s/{tok2}", f"{d.get('fullUrl')} / {d.get('url')}")
+    st, _, raw = req(base, "/api/session", cookies=ck_admin)
+    chk("管理员 /api/session 带上 publicUrl（供前端提示）",
+        st == 200 and jbody(raw).get("publicUrl") == "https://photos.example.com",
+        f"{jbody(raw).get('publicUrl')}")
+
+    server.ADMIN_CFG["publicUrl"] = ""
+    st, _, raw = req(base, "/api/share/create", "POST",
+                     {"lib": "t", "rels": [R[0]], "title": "NOPUB"},
+                     {"X-SL-Admin": "1"}, ck_admin)
+    chk("未配 publicUrl → fullUrl 为空串（前端用 location.origin 兜底）",
+        st == 200 and jbody(raw).get("fullUrl") == "", f"{jbody(raw).get('fullUrl')!r}")
+    server.ADMIN_CFG["publicUrl"] = old_pub or ""
+
+    # 走一遍真实的「从 admin.json 读」路径（不只是归一化函数本身）
+    _bak = (server.ADMIN_CFG_PATH, server.ADMIN_PW, server.ADMIN_SOURCE,
+            server.ADMIN_CFG.get("sessionHours"))
+    _fd, _tf = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(_fd, "w", encoding="utf-8") as _f:
+        json.dump({"adminToken": "tmp-only", "publicUrl": "photos.example.com/"}, _f)
+    try:
+        server.ADMIN_CFG_PATH = _tf
+        server.set_admin_config(None)
+        chk("set_admin_config 从 admin.json 读入并归一化 publicUrl",
+            server.ADMIN_CFG.get("publicUrl") == "https://photos.example.com",
+            f"{server.ADMIN_CFG.get('publicUrl')!r}")
+    finally:
+        server.ADMIN_CFG_PATH, server.ADMIN_PW, server.ADMIN_SOURCE = _bak[:3]
+        server.ADMIN_CFG["sessionHours"] = _bak[3]
+        os.remove(_tf)
 
     # =========================================================
     sect("组 5 · 未配口令时降级（R8）")
