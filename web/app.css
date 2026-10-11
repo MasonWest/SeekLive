@@ -217,6 +217,44 @@ body.selecting .day-hd .d-pick{display:inline-flex;align-items:center}
 }
 .day-hd .d-pick-cb:disabled{opacity:.5;cursor:default}
 
+/* ---------------- 密度分组（L4 按月 / L5 按年）----------------
+   五档密度和「时间浏览层级」一起变：
+     L1–L3 逐日分组（日期头 sticky）
+     L4    按月组织  → 收起日期头，月份分隔成为主层级
+     L5    按年组织  → 再收起月份分隔（降级为小标签），年份分隔成为主层级
+   年份分隔始终渲染，只有 L5 显示 —— 这样切档只改 class，不重排 DOM。 */
+.year-sep{
+  display:none;
+  padding:22px calc(var(--safe-r) + 14px) 8px calc(var(--safe-l) + 14px);
+  font-size:22px;font-weight:750;letter-spacing:-.02em;color:var(--fg);
+}
+.year-sep span{color:var(--fg-3);font-size:13px;font-weight:500;margin-left:8px;
+  letter-spacing:0}
+html.grp-year .year-sep{display:block}
+
+/* 总览档：收起日期头，日期分组之间不留缝（照片连成一片才叫总览） */
+html.grp-month .day-hd,
+html.grp-year .day-hd{display:none}
+html.grp-month .day-blk,
+html.grp-year .day-blk{margin-bottom:0}
+
+/* 年份总览：月份分隔降级成小标签，让「年」成为主层级 */
+html.grp-year .month-sep{padding:13px calc(var(--safe-r) + 14px) 5px calc(var(--safe-l) + 14px);
+  font-size:14px;font-weight:660}
+html.grp-year .month-sep span{font-size:11.5px;margin-left:6px}
+
+/* 高密度档位：格子圆角收紧，网格更整齐 */
+html.grp-month .tile{border-radius:6px}
+html.grp-year .tile{border-radius:3px}
+@media (min-width:640px){
+  html.grp-month .tile{border-radius:9px}
+  html.grp-year .tile{border-radius:4px}
+}
+@media (min-width:1000px){
+  html.grp-year .month-sep{padding-left:calc(var(--safe-l) + 22px);
+    padding-right:calc(var(--safe-r) + 22px)}
+}
+
 .grid{
   display:grid;gap:var(--gap);
   grid-template-columns:repeat(var(--cols),1fr);
@@ -289,6 +327,49 @@ body.selecting .day-hd .d-pick{display:inline-flex;align-items:center}
   animation:dropIn .26s var(--ease);
 }
 .to-top:active{transform:scale(.92)}
+
+/* ---------------- 密度控制（常驻五档控制器）----------------
+   − 更密集（每行更多） ｜ 中间＝当前档（点心打开五档面板） ｜ + 更宽松
+   只改 CSS 列数与时间层级；缩略图永远是同一份 640。 */
+.den-ctl{
+  position:fixed;left:50%;transform:translateX(-50%);
+  bottom:calc(var(--safe-b) + 14px);z-index:65;
+  display:flex;align-items:center;gap:2px;padding:4px;
+  border-radius:999px;
+  background:var(--glass-2);border:1px solid var(--line);
+  -webkit-backdrop-filter:saturate(180%) blur(18px);
+  backdrop-filter:saturate(180%) blur(18px);
+  box-shadow:var(--shadow-m);
+  /* ★ 不能用通用 dropIn：它是 transform:none 结尾 + fill:both，
+     会把居中用的 translateX(-50%) 一起吃掉（表现为控件贴在中线右侧）。 */
+  animation:denIn .3s var(--ease) both;
+}
+@keyframes denIn{
+  from{opacity:0;transform:translateX(-50%) translateY(10px)}
+  to{opacity:1;transform:translateX(-50%)}
+}
+.den-ctl.den-off{display:none}
+.den-btn{
+  width:42px;height:42px;border-radius:50%;display:grid;place-items:center;
+  color:var(--fg);transition:.16s var(--ease)
+}
+.den-btn:active{transform:scale(.9)}
+.den-btn:disabled{opacity:.3}
+.den-btn svg{width:20px;height:20px;fill:none;stroke:currentColor;
+  stroke-width:2.2;stroke-linecap:round}
+.den-mid{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  min-width:76px;height:42px;padding:0 10px;border-radius:999px;
+  color:var(--fg);transition:.16s var(--ease)
+}
+.den-mid:active{transform:scale(.96)}
+.den-name{font-size:13px;font-weight:660;line-height:1}
+.den-dots{display:flex;gap:3px}
+.den-dots i{width:5px;height:5px;border-radius:50%;background:var(--fg-3);
+  opacity:.45;transition:.18s var(--ease)}
+.den-dots i.on{background:var(--brand);opacity:1;transform:scale(1.3)}
+/* 选择模式下底部被操作条占用 → 让位 */
+body.selecting .den-ctl{display:none}
 
 /* ---------------- 灯箱 ---------------- */
 .viewer{position:fixed;inset:0;z-index:120;background:#06070a;color:#fff;

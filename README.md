@@ -306,6 +306,7 @@ python server.py --rebuild-index :: 丢弃索引重建
 | 服务端缓存            | 缩略图 / 大图 / 转码产物全部落盘，命中约 3–9ms；并发单飞只生成一次                                                                                                                              |
 | **孤儿缓存回收**       | 缓存清单 `data/cache.db` 记录每个缓存的来源；失效/残留缓存可**先预览再回收**，且**只删 `cache/` 内文件，绝不触碰源照片**。类别：`tmp_leak`（中断残留）/ `unrecorded`（清单无记录）/ `missing_source`（源已消失）/ `changed_source`（源已改动）/ **`obsolete_variant`（缩略图旧规格，见下）**                       |
 | **缩略图单档 640**     | 缩略图只有**一个规格 640**：同一张照片最多一份缩略图缓存，网格密度只是 CSS 缩放、不再切换图片 URL。历史参数（`s=240/480/960`…）由服务端统一**吸附**到 640，旧书签 / 旧页面不报错也不会生成旧档；升级时可单独执行 `?cls=obsolete_variant` 回收历史旧规格缓存（**源在回收站 / 图库离线一律保留**，不靠文件名猜规格） |
+| **照片墙五档密度**      | 常驻底部控制器：`−` 更密集 ｜ 当前档名 ｜ `+` 更宽松，点档名（或顶栏密度图标）打开**五档面板**。五档为 **大图 · 标准 · 密集 · 月份 · 年份**，密度与**时间浏览层级**一起变：前三档逐日分组，「月份」收起日期头、按**月**组织，「年份」再把月份分隔降级成小标签、以**年**为主层级。切换只改 CSS 列数与分组 class —— **不动 DOM、不重新请求、不改图片 URL**（缩略图仍是同一份 640），并**锚定当前分组保住浏览位置**、对可见格子做形变过渡（尊重 `prefers-reduced-motion`）；档位记在 `localStorage`（默认「标准」） |
 | **回收站（删除 / 恢复）** | 删除 = **移入 `data/trash/`**（不是永久删除），默认保留 **30 天**可完整恢复；顶栏「**最近删除**」面板可看缩略图 / 删除时间 / **剩余天数**，支持单项与批量恢复，冲突默认**不覆盖**；Live Photo 图片与配对 MOV **成组**处理；服务端强制「需管理授权、只读图库禁止删除」 |
 | **访问控制（默认拒绝）**   | 配了管理口令后，只读接口**默认拒绝**：除首页外壳与身份接口外一律要身份，**本机与局域网同一套规则**；按语义返回 401（未登录）/ 403（越权）/ 404（分享不存在或已撤销）；`access.protectRead:false` 可退回"浏览公开"                       |
 | **免登录分享**       | 管理员手动选择、**一键全选本月**、或**按天选择**（每个日期标题后的选择框）→ 生成 `/s/<256bit 令牌>` 只读链接；链接地址可用 `admin.json → publicUrl` 换成公网域名；**授权集合在创建时固化**并在服务端过滤；令牌只存摘要、明文只回显一次；可随时撤销且**下一个请求立即失效**；分享媒体强制 `private, no-store`（不被 CDN 缓存）    |
@@ -358,6 +359,7 @@ SeekLive/
 │   ├── test_thumb_spec.py    缩略图单档 640 / 旧参数吸附（24 项）
 │   ├── test_thumb_variant_gc.py 缩略图旧规格回收 obsolete_variant（41 项）
 │   ├── check_frontend_thumb.mjs 前端调用链静态守卫（14 项，无需浏览器）
+│   ├── check_frontend_density.mjs 照片墙五档密度静态守卫（39 项，无需浏览器）
 │   ├── fixture_server.py     E2E 用的隔离夹具服务（临时假图库 + 临时 shares.db）
 │   └── e2e/                  真实浏览器端到端验收
 ├── data/index.db         持久化索引（SQLite，WAL 模式）—— 可随时删
@@ -539,6 +541,7 @@ python tests/test_access.py        # 访问控制 / 分享权限矩阵（进程�
 python tests/test_index.py         # 索引与目录语义（需要素材目录，见下）
 python tests/test_conn_reset.py    # 客户端提前断开不该在控制台刷 Traceback（进程内起服务，不占端口）
 node tests/check_frontend_thumb.mjs # 前端缩略图调用链静态守卫（无需浏览器/Playwright）
+node tests/check_frontend_density.mjs # 照片墙五档密度 / 时间层级 / 单档契约 静态守卫
 node tests/e2e/verify_ui.js        # 端到端（需先启动服务；Playwright + 本机 Chromium）
 node tests/e2e/qa_live_lightbox.js # 实况灯箱：静图/动图同框 + 声音开关 + 三种条目回归
 node tests/e2e/qa_keep_scroll.js   # 删除/恢复后保持浏览位置（不真删图：只跑重建路径）
@@ -546,6 +549,9 @@ node tests/e2e/qa_share.js         # 访问控制 / 分享浏览器回归（自�
 ```
 
 > 多数测试在**独立测试树**里跑，不碰真实图库。
+> `test_admin_auth.py` 会拉起真实的 `server.py` 子进程，因此用
+> `SEEKLIVE_STATE_PREFIX=test_` 把自己的 `server.pid` / `server.port` 与正在运行的服务
+> **分开** —— 否则它起实例前的那次 `--stop` 会照着全局标记文件，把你正在跑的服务一起杀掉。
 >   
 > `tests/test_index.py` 需要 HEIC / MOV / JPEG 素材，通过环境变量
 >   

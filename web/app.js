@@ -59,14 +59,44 @@ function canPlayHevc() {
 /* ★ 缩略图只有一个规格：640（与后端 THUMB_KEEP_SIDES 对齐）。
    不再有 srcset 候选集 —— 同一张源图只生成/请求一份缓存，网格密度只是 CSS 缩放。 */
 const THUMB_SIZE = 640;
-const DENSITY_STEPS = [110, 150, 210];      // 单块目标宽度（px）
+
+/* ★ 照片墙五档密度 —— 密度和「时间浏览层级」一起变，不是单纯加两个列数选项。
+   L1 大图   2 张/行（手机）  逐日分组，适合认真看细节 / 认人
+   L2 标准   4 张/行（手机）  逐日分组，日常浏览（默认档）
+   L3 密集   6 张/行（手机）  逐日分组，快速扫图
+   L4 月份  ~15 张/行（手机） **按月份组织**（收起日期头，月份分隔成为主层级）
+   L5 年份  ~30 张/行（手机） **按年份组织**（月份分隔降级为小标签，年份分隔为主层级）
+   · target＝单元格「目标宽度(px)」，列数 = clamp(round(可用宽/target), min, max)。
+     min/max 只用来兜住极端窄屏 / 超宽屏，不改变档位之间的相对关系。
+   · ★ 无论哪一档都只请求 640 单档缩略图 —— 密度纯粹是 CSS 缩放，不碰缓存规格。 */
+const DENSITY_LEVELS = [
+  { key: 'l1', name: '大图', target: 210, min: 2, max: 12, group: 'day' },
+  { key: 'l2', name: '标准', target: 110, min: 3, max: 22, group: 'day' },
+  { key: 'l3', name: '密集', target: 72, min: 4, max: 30, group: 'day' },
+  { key: 'l4', name: '月份', target: 27, min: 6, max: 32, group: 'month' },
+  { key: 'l5', name: '年份', target: 13.5, min: 8, max: 44, group: 'year' },
+];
+const DENSITY_LS_KEY = 'sl.density';
+const DENSITY_DEFAULT = 1;                    // L2 标准
 const TILE_BATCH = 20;                      // 每次追加的日期分组数
 const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+/* 记住上次选择（读不到 / 越界 → 回到默认档） */
+function loadDensity() {
+  try {
+    const v = parseInt(localStorage.getItem(DENSITY_LS_KEY), 10);
+    if (Number.isFinite(v) && v >= 0 && v < DENSITY_LEVELS.length) return v;
+  } catch (e) { /* 隐私模式 / 被禁用 → 用默认 */ }
+  return DENSITY_DEFAULT;
+}
+function saveDensity(i) {
+  try { localStorage.setItem(DENSITY_LS_KEY, String(i)); } catch (e) {}
+}
 
 const state = {
   libs: [], lib: null, tree: null,
   days: [], renderedDayIdx: 0, done: false,
-  density: 1, cols: 3,
+  density: loadDensity(), cols: 3, yearCounts: {},
   search: { active: false, q: '', off: 0, total: 0, done: false },
   items: new Map(),                          // dayKey -> items
   viewer: { list: [], i: 0, scale: 1, tx: 0, ty: 0 },
@@ -140,13 +170,38 @@ function toast(msg, ms = 2000) {
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
 
-/* ---------------- 布局 ---------------- */
-function computeCols() {
+/* ---------------- 布局 / 密度 ---------------- */
+/* 某个档位在「当前视口宽」下会排成几列（面板里给用户看的就是这个数） */
+function colsForLevel(lv) {
   const w = Math.min(window.innerWidth, 2200);
-  const target = DENSITY_STEPS[state.density];
-  const cols = Math.max(2, Math.round((w - 16) / target));
+  return Math.max(lv.min, Math.min(lv.max, Math.round((w - 16) / lv.target)));
+}
+function computeCols() {
+  const lv = DENSITY_LEVELS[state.density] || DENSITY_LEVELS[DENSITY_DEFAULT];
+  const cols = colsForLevel(lv);
   state.cols = cols;
-  document.documentElement.style.setProperty('--cols', cols);
+  const root = document.documentElement;
+  root.style.setProperty('--cols', cols);
+  // 时间浏览层级：day / month / year —— 用 class 切换，不重排 DOM，滚动位置才好保
+  root.classList.remove('grp-day', 'grp-month', 'grp-year');
+  root.classList.add('grp-' + lv.group);
+  root.dataset.density = lv.key;
+}
+/* 网格里单个格子的实际宽度（含 gap 影响），预加载余量按它折算 */
+function tileCellPx() {
+  const w = Math.min(window.innerWidth, 2200);
+  const gap = parseFloat(getComputedStyle(document.documentElement)
+    .getPropertyValue('--gap')) || 4;
+  return Math.max(6, (w - 16 - (state.cols - 1) * gap) / state.cols);
+}
+/* 预加载余量：格子越大越可以早拉（但别超过 900px）；
+   高密度档格子很小，若仍用 900px 会一次触发几十天的 /api/items → 请求风暴。 */
+function observerMargin() {
+  return Math.max(320, Math.min(900, Math.round(tileCellPx() * 7)));
+}
+function prefersReduce() {
+  try { return window.matchMedia('(prefers-reduced-motion:reduce)').matches; }
+  catch (e) { return false; }
 }
 function syncTopbarHeight() {
   const h = $('#topbar').offsetHeight;
@@ -158,6 +213,7 @@ function syncTopbarHeight() {
    ===================================================== */
 async function boot() {
   computeCols();
+  rearmObserver();                            // 用真实列数定下预加载余量
   syncTopbarHeight();
 
   // ① 先问服务端「我是谁」——访问作用域的唯一权威来源。
@@ -299,10 +355,21 @@ async function selectLib(id, isBoot = false, anchor = null) {
     const [ym, d] = k.split('|');
     return { key: k, ym, d };
   });
+  // 每年总张数（「年份」档的年份分隔上要显示）
+  state.yearCounts = {};
+  (state.tree.months || []).forEach(m => {
+    const y = m.ym.slice(0, 4);
+    state.yearCounts[y] = (state.yearCounts[y] || 0) + m.n;
+  });
   buildMonthSheet();
   resetRail();
   state.switching = false;
-  if (!state.days.length) { renderEmpty('暂无图片', '这个图库里还没有可显示的图片。'); return; }
+  if (!state.days.length) {
+    $('#denCtl').hidden = true;
+    renderEmpty('暂无图片', '这个图库里还没有可显示的图片。'); return;
+  }
+  $('#denCtl').hidden = false;                // 时间轴出来了，密度控制器才露面
+  syncDen();
   renderNextBatch();
   requestAnimationFrame(syncRail);
   // anchor：删除/恢复后的原地重建 → 回到原来那个日期分组；
@@ -334,11 +401,24 @@ function renderNextBatch() {
   const frag = document.createDocumentFragment();
   const to = Math.min(state.days.length, from + TILE_BATCH);
   let lastYm = from > 0 ? state.days[from - 1].ym : null;
+  let lastYr = lastYm ? lastYm.slice(0, 4) : null;
   const created = [];
 
   for (let i = from; i < to; i++) {
     const day = state.days[i];
     if (!day) break;
+    // 年份分隔：**所有档位都渲染**，只有「年份」档用 CSS 显示出来
+    //   —— 这样切档只换 class，不用重排 DOM，浏览位置才不会跳。
+    const yr = day.ym.slice(0, 4);
+    if (yr !== lastYr) {
+      const ysep = document.createElement('div');
+      ysep.className = 'year-sep';
+      ysep.dataset.yr = yr;
+      ysep.innerHTML = `${yr} 年<span>${countOfYear(yr)} 张</span>`;
+      frag.appendChild(ysep);
+      lastYr = yr;
+      lastYm = null;                          // 年变了 → 月分隔必须重新出一次
+    }
     if (day.ym !== lastYm) {
       const sep = document.createElement('div');
       sep.className = 'month-sep';
@@ -367,14 +447,35 @@ function countOfMonth(ym) {
   const m = (state.tree.months || []).find(x => x.ym === ym);
   return m ? m.n.toLocaleString() : '';
 }
+function countOfYear(yr) {
+  const n = state.yearCounts[yr];
+  return n == null ? '' : n.toLocaleString();
+}
 
-const groupObserver = new IntersectionObserver(entries => {
-  entries.forEach(e => {
-    if (!e.isIntersecting) return;
-    groupObserver.unobserve(e.target);
-    loadDay(e.target);
+/* 日期分组的懒加载：滚到附近才去拉这一天的 items。
+   余量随格子尺寸自适应（高密度档格子很小，余量必须收窄，
+   否则一次会命中几十天 → 一屏打出几百个 /api/items）。 */
+let groupObserver = null;
+function makeGroupObserver() {
+  return new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      groupObserver.unobserve(e.target);
+      loadDay(e.target);
+    });
+  }, { rootMargin: `${observerMargin()}px 0px` });
+}
+groupObserver = makeGroupObserver();
+function rearmObserver() {
+  if (!groupObserver) return;
+  groupObserver.disconnect();
+  groupObserver = makeGroupObserver();
+  // 已经画过真图的分组不用再看；只把还没画的重挂上
+  $$('#timeline .day-blk').forEach(el => {
+    const g = el.querySelector('.grid');
+    if (g && g.dataset.painted !== '1') groupObserver.observe(el);
   });
-}, { rootMargin: '900px 0px' });
+}
 
 function makeDayBlock(day) {
   const el = document.createElement('section');
@@ -1246,13 +1347,164 @@ $('#btnGc').onclick = async e => {
   }
 };
 
-$('#btnDensity').onclick = () => {
-  state.density = (state.density + 1) % DENSITY_STEPS.length;
-  computeCols();
-  // ★ 密度只改 CSS 列数（--cols），不改图片 URL：网格里永远是同一份 640 缩略图，
-  //   由浏览器等比缩放显示。这也是单档 640 能省下一整套多档缓存的原因。
-  toast(['大图', '标准', '紧凑'][2 - state.density] + '视图', 1200);
-};
+/* =====================================================
+   密度控制（五档）—— 常驻 pill ＋ 五档选择面板
+   ===================================================== */
+/* 当前视口最顶上那个「已渲染的日期分组」。
+   列数一变整页高度会大幅变化，切档后把它拉回原来的屏幕位置，
+   用户才不会突然被弹回顶部。 */
+function topVisibleBlock() {
+  const off = topbarOffset() + 4;
+  let best = null, bestTop = -Infinity;
+  $$('#timeline .day-blk').forEach(el => {
+    const t = el.getBoundingClientRect().top;
+    if (t <= off && t > bestTop) { bestTop = t; best = el; }
+  });
+  return best || $('#timeline .day-blk');
+}
+/* FLIP 采样：在屏上撒点取元素，比遍历上千个 tile 快得多 */
+function visibleTiles(n) {
+  const out = [], seen = new Set();
+  const H = window.innerHeight, W = window.innerWidth;
+  for (let r = 1; r <= 8 && out.length < n; r++) {
+    const y = H * r / 9;
+    for (let c = 1; c <= 6 && out.length < n; c++) {
+      const hits = document.elementsFromPoint(W * c / 7, y);
+      for (const el of hits) {
+        if (el.classList && el.classList.contains('tile')) {
+          if (!seen.has(el)) { seen.add(el); out.push(el); }
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+/* 让采样到的格子从旧几何「飞」到新几何 —— 切档是一个形变，不是硬跳。
+   ★ .tile 的进场动画是 animation-fill:both，动画值优先级高于内联样式，
+     不摘掉它，下面写的 transform 会被吃掉。 */
+function flipTiles(tiles, before) {
+  const after = tiles.map(t => t.getBoundingClientRect());
+  let moved = 0;
+  tiles.forEach((t, k) => {
+    const b = before[k], a = after[k];
+    if (!b || !a || !b.width || !a.width) return;
+    const dx = b.left - a.left, dy = b.top - a.top, sc = b.width / a.width;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1 && Math.abs(sc - 1) < .03) return;
+    t.style.animation = 'none';
+    t.style.transition = 'none';
+    t.style.transformOrigin = 'top left';
+    t.style.zIndex = '6';
+    t.style.transform = `translate(${dx}px,${dy}px) scale(${sc})`;
+    moved++;
+  });
+  if (!moved) return;
+  requestAnimationFrame(() => {
+    tiles.forEach(t => {
+      if (!t.style.transform) return;
+      t.style.transition = 'transform .34s var(--ease)';
+      t.style.transform = '';
+    });
+    setTimeout(() => tiles.forEach(t => {
+      t.style.transition = ''; t.style.transform = '';
+      t.style.transformOrigin = ''; t.style.zIndex = '';
+    }), 460);
+  });
+}
+/* 切档：只改 CSS 列数 + 分组 class，不动 DOM、不改图片 URL、不重新请求数据 */
+function setDensity(i) {
+  i = Math.max(0, Math.min(DENSITY_LEVELS.length - 1, i | 0));
+  if (i === state.density) { syncDenUI(); return; }
+
+  const anchor = topVisibleBlock();
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
+  const anim = !prefersReduce() && !state.search.active;
+  const probes = anim ? visibleTiles(16) : [];
+  const before = probes.map(t => t.getBoundingClientRect());
+
+  state.density = i;
+  computeCols();                                  // --cols ＋ grp-day/month/year
+  sizeSkeletons($$('#timeline .day-blk'));        // 列数变了，骨架高度必须重算
+  rearmObserver();                                // 预加载余量随格子尺寸重算
+
+  if (anchor) {                                   // 位置保持
+    window.scrollBy(0, anchor.getBoundingClientRect().top - anchorTop);
+  }
+  if (probes.length) flipTiles(probes, before);
+
+  saveDensity(i);
+  syncDenUI();
+  toast(DENSITY_LEVELS[i].name + '视图', 1000);
+}
+function syncDenUI() {
+  const lv = DENSITY_LEVELS[state.density];
+  if (!lv) return;
+  const name = $('#denName');
+  if (name) name.textContent = lv.name;
+  const dots = $('#denDots');
+  if (dots) {
+    if (dots.children.length !== DENSITY_LEVELS.length) {
+      dots.innerHTML = DENSITY_LEVELS.map(() => '<i></i>').join('');
+    }
+    Array.prototype.forEach.call(dots.children,
+      (d, k) => d.classList.toggle('on', k === state.density));
+  }
+  const out = $('#denOut'), inn = $('#denIn');
+  if (out) out.disabled = state.density >= DENSITY_LEVELS.length - 1;  // 已是最密
+  if (inn) inn.disabled = state.density <= 0;                          // 已是最宽
+  const mid = $('#denMid');
+  if (mid) mid.title = '照片大小：' + lv.name;
+}
+function buildDenSheet() {
+  const box = $('#denList');
+  if (!box) return;
+  box.innerHTML = '';
+  DENSITY_LEVELS.forEach((lv, k) => {
+    const cols = colsForLevel(lv);
+    const hint = lv.group === 'day' ? `${cols} 张 / 行`
+      : lv.group === 'month' ? `${cols} 张 / 行 · 按月浏览`
+        : `${cols} 张 / 行 · 按年浏览`;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'm-item' + (k === state.density ? ' on' : '');
+    b.innerHTML = `<div class="mym">${lv.name}</div><div class="mn">${hint}</div>`;
+    b.onclick = () => { $('#denSheet').hidden = true; setDensity(k); };
+    box.appendChild(b);
+  });
+}
+function openDenSheet() {
+  buildDenSheet();
+  $('#denSheet').hidden = false;
+  syncDen();
+}
+/* 灯箱 / 弹层 / 选择模式打开时把 pill 收起来（让位，也避免误触） */
+const DEN_OVERLAYS = ['#viewer', '#sheet', '#trashSheet', '#idxSheet',
+  '#shareSheet', '#denSheet', '#preview', '#confirm', '#vDetail'];
+function syncDen() {
+  const el = $('#denCtl');
+  if (!el) return;
+  const blocked = DEN_OVERLAYS.some(s => {
+    const o = $(s); return o && !o.hidden;
+  }) || document.body.classList.contains('selecting');
+  el.classList.toggle('den-off', blocked);
+}
+$('#btnDensity').onclick = openDenSheet;          // 工具栏图标 → 同一个五档面板
+$('#denOut').onclick = () => setDensity(state.density + 1);   // − 更密集
+$('#denIn').onclick = () => setDensity(state.density - 1);    // ＋ 更宽松
+$('#denMid').onclick = openDenSheet;
+$('#denSheet').addEventListener('click', e => {
+  if (e.target.dataset.close !== undefined) $('#denSheet').hidden = true;
+});
+{
+  const mo = new MutationObserver(syncDen);
+  DEN_OVERLAYS.forEach(s => {
+    const o = $(s);
+    if (o) mo.observe(o, { attributes: true, attributeFilter: ['hidden'] });
+  });
+  new MutationObserver(syncDen)
+    .observe(document.body, { attributes: true, attributeFilter: ['class'] });
+}
+syncDenUI();
 
 $('#btnInfo').onclick = async () => {
   // 分享访客：统计 / 索引 / 缓存都是 admin-only（服务端会 403），只展示分享自身信息
@@ -2339,6 +2591,7 @@ window.addEventListener('resize', () => {
   rt = setTimeout(() => {
     computeCols(); syncTopbarHeight();
     sizeSkeletons($$('.day-blk'));            // 列数变了，重算骨架高度
+    rearmObserver();                          // 预加载余量也跟着格子尺寸走
     syncRail();
   }, 120);
 }, { passive: true });

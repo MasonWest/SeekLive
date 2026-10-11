@@ -112,6 +112,23 @@
   <svg viewBox="0 0 24 24"><path d="M12 19V6M6 12l6-6 6 6"/></svg>
 </button>
 
+<!-- ── 照片墙密度控制（五档：大图 / 标准 / 密集 / 月份 / 年份）────
+     常驻可见： − 更密集（每行更多） ｜ 中间显示当前档并可打开五档面板 ｜ + 更宽松
+     只改 CSS 列数与时间层级，不改图片 URL —— 缩略图始终是单档 640。 -->
+<div id="denCtl" class="den-ctl" hidden>
+  <button class="den-btn" id="denOut" type="button" aria-label="更密集（每行更多）">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12"/></svg>
+  </button>
+  <button class="den-mid" id="denMid" type="button" aria-haspopup="dialog"
+          aria-label="照片大小">
+    <span class="den-name" id="denName">标准</span>
+    <span class="den-dots" id="denDots" aria-hidden="true"></span>
+  </button>
+  <button class="den-btn" id="denIn" type="button" aria-label="更宽松（每行更少）">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v12M6 12h12"/></svg>
+  </button>
+</div>
+
 <!-- ── 灯箱 ──────────────────────────────────────── -->
 <div id="viewer" class="viewer" hidden>
   <div class="v-stage" id="vStage">
@@ -186,6 +203,16 @@
       </button>
       <button class="sf-btn" id="btnShareManage">🔗 分享管理</button>
     </div>
+  </div>
+</div>
+
+<!-- ── 照片大小（五档）选择面板 ───────────────────── -->
+<div id="denSheet" class="sheet" hidden>
+  <div class="sheet-bg" data-close></div>
+  <div class="sheet-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head">照片大小</div>
+    <div class="sheet-scroll" id="denList"></div>
   </div>
 </div>
 
