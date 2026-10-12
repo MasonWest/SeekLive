@@ -62,6 +62,7 @@ import shutil
 import socket
 import hmac
 import hashlib
+import ipaddress
 import secrets
 import threading
 import contextlib
@@ -1873,6 +1874,75 @@ def norm_public_url(v):
     if not re.match(r"^https?://", s, re.I):
         s = "https://" + s
     return s
+
+
+# ---------- 公网 Tunnel 请求识别（安全边界，改动前务必读懂） ----------
+# Cloudflare Tunnel 的 cloudflared 与本服务**同机**运行，一律从本机回环地址
+# （127.0.0.1 / ::1）连入 localhost:9000；局域网 / EasyTier 请求的对端则分别是
+# 局域网 IP 与 EasyTier 虚拟 IP（如 10.126.126.x），天然不是回环。
+#
+# 因此「回环对端 + cloudflared / CF 边缘必加的特征头」就是公网请求的可靠判据：
+#   · 公网攻击者的唯一入口是 cloudflared → 对端必然是回环，且 cloudflared 一定
+#     会带上 X-Forwarded-Proto / X-Forwarded-For / CF-Connecting-IP 等头（请求
+#     内容无法把它们剥掉；伪造只会被追加/覆盖，头依然存在）；
+#   · 攻击者也无法让 TCP 对端变成局域网 IP —— 那需要能直连本机端口。
+# 反过来，本地伪造这些头只能让**本机**请求被误判成公网（权限被收紧而非放宽）——
+# 而本机进程本来就能直接读 admin.json 与照片，不构成权限提升。
+#
+# 两条判据满足其一即视为公网（判定只可能收紧权限、不可能放宽）：
+#   ① Host 声称是 admin.json → publicUrl 的公网域名（cloudflared 原样透传 Host）；
+#   ② 对端是回环，且带有任一 cloudflared / CF 边缘特征头。
+_PUBLIC_MARKERS = ("X-Forwarded-Proto", "X-Forwarded-For", "X-Forwarded-Host",
+                   "CF-Connecting-IP", "Cf-Connecting-IP", "Cf-Ray",
+                   "CF-IPCountry", "Cf-IPCountry", "Cf-Visitor", "CF-Worker")
+
+
+def _host_only(v):
+    """从 Host 头 / publicUrl 里取主机名：去端口、去空白、转小写。"""
+    s = str(v or "").split(",")[0].strip()
+    if not s:
+        return ""
+    if s.startswith("["):                       # IPv6 字面量 [::1]:9000
+        end = s.find("]")
+        return s[1:end].lower() if end > 1 else ""
+    if "//" in s:                               # 传进来的是 URL（publicUrl 带协议）
+        s = urllib.parse.urlparse(s).netloc or s
+    return s.split(":")[0].strip().lower()
+
+
+def public_hosts():
+    """公网域名集合（来自 admin.json → publicUrl；未配置则为空集）。"""
+    h = _host_only(ADMIN_CFG.get("publicUrl") or "")
+    return frozenset({h}) if h else frozenset()
+
+
+def is_loopback_ip(ip):
+    """回环地址（兼容 ::ffff:127.0.0.1 这类 IPv4-mapped 形式）。"""
+    try:
+        a = ipaddress.ip_address(str(ip or "").strip())
+    except ValueError:
+        return False
+    if a.is_loopback:
+        return True
+    mapped = getattr(a, "ipv4_mapped", None)
+    return bool(mapped is not None and mapped.is_loopback)
+
+
+def is_public_request(peer_ip, header_get):
+    """本请求是否来自公网 Tunnel。header_get 传 self.headers.get。
+
+    判据见上方注释：① Host 是公网域名；② 回环对端 + cloudflared/CF 特征头。
+    注意**绝不**单独采信 X-Forwarded-For / Host 的内容来「提升」信任 ——
+    它们只能与回环对端联合把请求判成公网（收紧），不能把请求判成内网（放宽）。
+    """
+    if _host_only(header_get("Host")) in public_hosts():
+        return True
+    if not is_loopback_ip(peer_ip):
+        return False
+    for h in _PUBLIC_MARKERS:
+        if str(header_get(h) or "").strip():
+            return True
+    return False
 
 
 def set_admin_config(cli_token=None):
@@ -4191,6 +4261,15 @@ class Handler(BaseHTTPRequestHandler):
     def share_token(self):
         return self.cookie_val(SHARE_COOKIE)
 
+    def from_public(self):
+        """本请求是否来自公网 Tunnel（cloudflared）。判据见 is_public_request。
+
+        纯函数式判定（只读 client_address 与 headers，不挂实例状态），
+        因此不受 keep-alive 复用 Handler 实例的影响。
+        """
+        peer = self.client_address[0] if self.client_address else ""
+        return is_public_request(peer, self.headers.get)
+
     def read_scope(self):
         """
         本次请求的身份：('admin', None) / ('share', rec) / ('anon', None)。
@@ -4203,7 +4282,10 @@ class Handler(BaseHTTPRequestHandler):
         cached = getattr(self, "_scope", None)
         if cached is not None:
             return cached
-        if self.admin_authed():
+        # 公网 Tunnel 请求一律不认管理会话：登录入口已被整体拒绝，这里再兜一层 ——
+        # 即使会话 Cookie 被带到公网域名，也不发生任何权限提升（与「撤销即时生效」
+        # 同一思路：身份判定只看当次请求，不做任何跨请求缓存）。
+        if self.admin_authed() and not self.from_public():
             out = ("admin", None)
         else:
             rec = share_rec_by_token(self.share_token())
@@ -4277,6 +4359,30 @@ class Handler(BaseHTTPRequestHandler):
             return 403, "来源校验未通过（跨站请求已拒绝）"
         return None, None
 
+    # 管理认证面：登录 / 登出 / 状态。公网一律关闭（在任何口令验证之前）。
+    #   /api/admin/status 虽在 ANON_GET 里（前端免登录探测用），但同样属认证面。
+    ADMIN_API_PATHS = frozenset({
+        "/api/admin/login", "/api/admin/logout", "/api/admin/status"})
+
+    def public_get_ok(self, path):
+        """公网请求允许的 GET 面 = 匿名白名单 + 分享落地页 + 分享可读接口。
+
+        刻意复用 ANON_GET / SHARE_GET：将来新增加的匿名/分享接口自动对公网开放，
+        而新增加的管理接口（不在这两个集合里）自动被关 —— 默认拒绝的方向。
+        """
+        if path in self.ADMIN_API_PATHS:
+            return False
+        return (path in self.ANON_GET or path.startswith("/s/")
+                or path in self.SHARE_GET)
+
+    def send_public_denied(self):
+        """公网 Tunnel 请求管理面：403（读取口令 / 校验会话之前就被拒绝）。"""
+        self.send_bytes(
+            json.dumps({"error": "公网访问已禁用管理员功能："
+                                 "请通过局域网或 EasyTier 进行管理操作"},
+                       ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8", 403)
+
     def media_guard(self, lib, rel):
         """媒体逐请求授权：admin 放行；share 需 (lib,rel) 在集合内（含配对视频）；anon 拒绝。
 
@@ -4329,6 +4435,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         qs = urllib.parse.parse_qs(parsed.query)
+
+        # ---- 公网 Tunnel：管理面整体关闭 ----
+        # 在任何口令验证 / 会话创建 / 权限提升**之前**拒绝。公网只保留匿名与分享
+        # 可见面（静态外壳、身份接口、分享落地页、分享可读的浏览/媒体接口）；
+        # 管理员认证、索引维护、缓存/回收站、分享管理等一律 403。
+        if self.from_public() and not self.public_get_ok(path):
+            return self.send_public_denied()
 
         # ★ 统一只读守卫：**默认拒绝**，只有匿名白名单（静态外壳 / 状态接口 /
         #   分享落地页）放行；其余一律先判身份再路由。
@@ -4410,6 +4523,12 @@ class Handler(BaseHTTPRequestHandler):
         #   出现 "Bad HTTP/0.9 request type" 并把请求体（可能含口令）写进访问日志。
         #   先读完即可同时消除「连接错乱」与「日志泄露」两个问题。
         self._body_raw = self._read_raw_body()
+        # ---- 公网 Tunnel：POST 面整体关闭 ----
+        # 现有 POST 全是管理操作（登录/登出、索引全量重建、分享管理、删除、回收站），
+        # 分享访客只读。请求体已先读完（避免连接错乱与口令落日志），随后直接拒绝 ——
+        # 此时尚未读取口令、尚未校验会话、更不可能创建或提升会话。
+        if self.from_public():
+            return self.send_public_denied()
         # ---- 管理授权（口令只走请求体，**永不**走 URL —— 避免进入访问日志/历史）----
         if path == "/api/admin/login":
             return self.api_admin_login()

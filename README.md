@@ -294,6 +294,29 @@ python server.py --rebuild-index :: 丢弃索引重建
 3. **公网 "撤销即时生效" 依赖 5.5 的缓存绕过。** 本项目的 CF 部署已实测通过；但如果你换了
    CDN 或反代，请自行确认规则真的生效 —— 直连（不经缓存）时的即时失效已被自动化测试覆盖。
 
+
+### 5.7 公网访问时禁用全部管理员功能（Cloudflare Tunnel）
+
+项目通过 Cloudflare Tunnel（如 `share.qqtang-match.fun`）暴露到公网时，服务端会**自动识别**
+公网请求，并在任何口令验证、会话创建之前直接拒绝全部管理员功能：
+
+- **判定方式（不可被客户端伪造）**，满足其一即视为公网请求：
+  1. 请求的 `Host` 等于 `admin.json` 里 `publicUrl` 的主机名；
+  2. TCP 对端是**回环地址**（cloudflared 与服务同机运行，隧道请求必然来自回环），
+     且请求带有 `X-Forwarded-Proto` / `X-Forwarded-For` / `CF-Connecting-IP` / `Cf-Ray` 等
+     Cloudflare 边缘必加的特征头。
+  客户端自报的 `X-Forwarded-For`、`Host` **不会被单独采信**：公网攻击者无法让自己的
+  TCP 对端变成非回环，也无法剥掉 cloudflared 添加的头；伪造这些头只会让本机请求被
+  更严格地判定为公网（权限只可能被收紧，不可能被放宽）。
+- **被拒绝的范围**（公网请求一律 403）：`/api/admin/login`、`/api/admin/logout`、
+  `/api/admin/status`，以及索引维护、缓存 / 回收站管理、分享创建与管理、源文件删除等
+  **全部管理面 GET 与 POST**。即使把别处取得的管理员会话 Cookie 带到公网域名，也不会发生
+  权限提升（`read_scope` 一律降为匿名）。
+- **不受影响**：匿名会话识别、分享列表 / 内容接口、缩略图 / 原图 / 视频 / Live Photo，
+  以及分享的撤销与过期语义 —— 公网访客的浏览路径与之前完全一致。
+- **回归测试**：`py -3 tests/test_public_guard.py`（判据真值表、公网封锁、分享不受影响、
+  伪造代理头不能绕过、真实 LAN / EasyTier 对端行为不变，共 114 项断言）。
+
 ---
 
 ## 六、功能清单

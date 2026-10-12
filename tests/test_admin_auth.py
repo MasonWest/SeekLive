@@ -201,6 +201,12 @@ class Srv:
                 d = jbody(raw)
                 if st == 200 and d.get("ready") is True and not d.get("indexing"):
                     return True, self.banner()
+                if st == 401:
+                    # ★ 会话可能在探视期间过期（组 5 用 0.0003 小时 ≈1 秒的会话
+                    #   测过期逻辑）→ 401 时补登一次。否则探针会把自己锁在门外
+                    #   直到超时，把「竞态」误报成「启动失败」。
+                    #   补登不会掩盖真实故障：登录/会话真坏了照样超时失败。
+                    self._login(probe)
             except Exception:
                 pass
             time.sleep(0.4)
@@ -215,17 +221,23 @@ class Srv:
             return (self.admin_json or {}).get("adminToken") or None
         return None
 
-    def _probe_opener(self):
-        """就绪探针用的 opener：配了口令 → 先登录拿会话；没配 → 匿名。"""
+    def _login(self, op):
+        """往给定 opener 里登录一次（配了口令才登；失败静默忽略）。"""
         tok = self._configured_token()
         if not tok:
-            return anonymous()
-        op, _ = new_session()
+            return
         try:
             request(self.base + "/api/admin/login", "POST", {"token": tok},
                     {"X-SL-Admin": "1"}, op, timeout=5)
         except Exception:
             pass
+
+    def _probe_opener(self):
+        """就绪探针用的 opener：配了口令 → 先登录拿会话；没配 → 匿名。"""
+        if not self._configured_token():
+            return anonymous()
+        op, _ = new_session()
+        self._login(op)
         return op
 
     def banner(self):
