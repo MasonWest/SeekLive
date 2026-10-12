@@ -4237,6 +4237,7 @@ class Handler(BaseHTTPRequestHandler):
         "/", "/index.html", "/app.css", "/app.js", "/favicon.svg",
         "/manifest.webmanifest",
         "/api/session",          # 统一身份接口（只回身份，不含任何相册数据）
+        "/api/bootstrap",        # 首屏合并接口：anon 身份下**同样只回身份**，见 api_bootstrap
         "/api/admin/status",     # 兼容保留
     })
     # 分享访客可读的路径；**具体到哪一张**由 media_guard / share_lib_view 逐条判定。
@@ -4343,6 +4344,8 @@ class Handler(BaseHTTPRequestHandler):
         # ---- API ----
         if path == "/api/session":
             return self.api_session()
+        if path == "/api/bootstrap":
+            return self.api_bootstrap()
         if path == "/api/admin/status":
             return self.api_admin_status()
         if path == "/api/libs":
@@ -4470,13 +4473,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     # ---------- 统一身份 / 图库列表 / 分享落地 ----------
-    def api_session(self):
-        """
-        GET /api/session —— 统一只读身份接口（anon / share / admin）。
-
-        前端**只依据本接口**判断身份；绝不用 URL 上 ?share=1 之类的提示参数当凭证
-        —— 那只是 UI 提示，不是授权。
-        """
+    def session_payload(self):
+        """/api/session 的载荷（/api/bootstrap 复用同一份，保证两者语义完全一致）。"""
         scope, rec = self.read_scope()
         out = {"scope": scope,
                "protectRead": bool(ACCESS_PROTECT),
@@ -4492,19 +4490,27 @@ class Handler(BaseHTTPRequestHandler):
                          "source": ADMIN_SOURCE if admin_required() else ""}}
         if scope == "share":
             out["share"] = share_public(rec, META["libs"].get(rec.get("lib_id")))
-        return self.send_json(out)
+        return out
 
-    def api_libs(self):
-        """GET /api/libs —— admin 见全部图库；share 只见被分享的那一个（数量=授权数）。"""
+    def api_session(self):
+        """
+        GET /api/session —— 统一只读身份接口（anon / share / admin）。
+
+        前端**只依据本接口**判断身份；绝不用 URL 上 ?share=1 之类的提示参数当凭证
+        —— 那只是 UI 提示，不是授权。
+        """
+        return self.send_json(self.session_payload())
+
+    def libs_payload(self):
+        """/api/libs 的载荷（/api/bootstrap 复用）。admin 见全部图库；share 只见被分享的一个。"""
         scope, rec = self.read_scope()
         if scope == "share":
             lib = META["libs"].get(rec.get("lib_id"))
             libs = [share_lib_public(lib, share_lib_view(lib, rec))] if lib else []
-            return self.send_json({
-                "libraries": libs, "trash": {"retentionDays": 0},
-                "indexing": False, "ready": True,
-                "scope": "share", "share": share_public(rec, lib)})
-        return self.send_json({
+            return {"libraries": libs, "trash": {"retentionDays": 0},
+                    "indexing": False, "ready": True,
+                    "scope": "share", "share": share_public(rec, lib)}
+        return {
             "libraries": [lib_public(META["libs"][i])
                           for i in META["lib_order"] if i in META["libs"]],
             "trash": {"retentionDays": int((META.get("trash") or DEFAULT_TRASH
@@ -4512,7 +4518,51 @@ class Handler(BaseHTTPRequestHandler):
             # 首次索引可能还在后台跑：前端据此显示进度面板而不是「没有照片」
             "indexing": bool(idx_get().get("running")),
             "ready": BOOTSTRAP_DONE.is_set(),
-            "scope": scope})
+            "scope": scope}
+
+    def api_libs(self):
+        """GET /api/libs —— admin 见全部图库；share 只见被分享的那一个（数量=授权数）。"""
+        return self.send_json(self.libs_payload())
+
+    def api_bootstrap(self):
+        """GET /api/bootstrap —— 首屏**一次往返**取回：session(+libs+tree+首日 items)。
+
+        背景：boot() 原本是 session→libs→tree→items 串行 4 步，在高延迟隧道上
+        光这几次小请求就要好几秒。这里把它们合成一次响应，**不新增任何可见范围**：
+
+        · 与 /api/session 一样列入匿名白名单（前端必须能据此判身份）；
+        · 但只要身份是 anon（且开了访问保护），就**只回 session** —— 与「/api/libs
+          对 anon 直接 401」的信息暴露面完全一致，绝不顺带吐相册数据；
+        · libs/tree/items 一律复用与独立端点**同一套** *_payload 方法与守卫，
+          因此分享范围（share_lib_view）与撤销语义不会有第二份实现。
+
+        首次索引未就绪 / 无可用图库 / 取树失败时，只回已拿到的部分，前端照旧分流。
+        """
+        out = {"session": self.session_payload()}
+        scope, _ = self.read_scope()
+        if ACCESS_PROTECT and scope not in ("admin", "share"):
+            return self.send_json(out)            # anon：只回身份
+        libs = self.libs_payload()
+        out["libs"] = libs
+        if libs.get("ready") is False or libs.get("indexing"):
+            return self.send_json(out)            # 首次索引未就绪 → 前端走进度面板
+        usable = [l for l in (libs.get("libraries") or [])
+                  if int(l.get("count") or 0) > 0]
+        if not usable:
+            return self.send_json(out)            # 由前端决定「空 / 无目录」提示
+        lid = usable[0]["id"]                     # 与前端「usable[0]」选择一致
+        tree, err = self.tree_payload({"lib": [lid]})
+        if err:
+            return self.send_json(out)
+        out["lib"], out["tree"] = lid, tree
+        order = tree.get("dayOrder") or []        # 首屏第一个日期分组
+        if order:
+            ym, _, dd = order[0].partition("|")
+            items, ierr = self.items_payload(
+                {"lib": [lid], "ym": [ym], "d": [dd], "lim": ["600"]})
+            if not ierr:
+                out["items"] = items
+        return self.send_json(out)
 
     def serve_share_landing(self, tok):
         """
@@ -4992,33 +5042,33 @@ class Handler(BaseHTTPRequestHandler):
             return lib, share_lib_view(lib, rec), None
         return lib, lib, None
 
-    def api_tree(self, qs):
+    def tree_payload(self, qs):
+        """/api/tree 的载荷。返回 (payload, err)；err 为 (code,msg) 时调用方直接回错。"""
         lib, cont, err = self._scope_container(qs)
         if err:
-            return self.send_err(*err)
+            return None, err
         pub = lib_public(lib)
         if cont is not lib:
             pub = share_lib_public(lib, cont)
-        return self.send_json({
+        return {
             "lib": pub,
             "months": [{"ym": m["ym"], "n": m["n"],
                         "days": [{"d": d["d"], "n": d["n"]} for d in m["days"]]}
                        for m in cont["months"]],
             "dayOrder": cont["day_order"],
-        })
+        }, None
 
-    def api_items(self, qs):
-        """
-        /api/items?lib=&ym=&d=&off=&lim=&sort=desc|asc
-        - 指定 ym+d → 该日全量（分页）
-        - 只指定 ym  → 该月全量（分页）
-        - 都不指定   → 全部（分页，供搜索/全部视图）
-
-        ★ share 作用域下，`src` 来自**授权集合的虚拟视图** —— 集合外的条目拿不到。
-        """
-        lib, cont, err = self._scope_container(qs)
+    def api_tree(self, qs):
+        payload, err = self.tree_payload(qs)
         if err:
             return self.send_err(*err)
+        return self.send_json(payload)
+
+    def items_payload(self, qs):
+        """/api/items 的载荷。返回 (payload, err)。"""
+        lib, cont, err = self._scope_container(qs)
+        if err:
+            return None, err
         ym = (qs.get("ym") or [""])[0]
         dd = (qs.get("d") or [""])[0]
         off = max(0, int((qs.get("off") or ["0"])[0] or 0))
@@ -5044,8 +5094,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             total = len(src)
             page = src[off:off + lim]
-        return self.send_json({"total": total, "off": off, "lim": lim,
-                               "items": [self.item_public(it) for it in page]})
+        return {"total": total, "off": off, "lim": lim,
+                "items": [self.item_public(it) for it in page]}, None
+
+    def api_items(self, qs):
+        """
+        /api/items?lib=&ym=&d=&off=&lim=&sort=desc|asc
+        - 指定 ym+d → 该日全量（分页）
+        - 只指定 ym  → 该月全量（分页）
+        - 都不指定   → 全部（分页，供搜索/全部视图）
+
+        ★ share 作用域下，`src` 来自**授权集合的虚拟视图** —— 集合外的条目拿不到。
+        """
+        payload, err = self.items_payload(qs)
+        if err:
+            return self.send_err(*err)
+        return self.send_json(payload)
 
     def api_search(self, qs):
         lib, cont, err = self._scope_container(qs)

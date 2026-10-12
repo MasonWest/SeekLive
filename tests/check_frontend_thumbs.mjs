@@ -7,7 +7,8 @@
  * 真机实测等了 18.0s（而缩略图本身只要 0.5s）。
  *
  * 本守卫锁定修复后的契约（web/app.js）：
- *   1. 有节流常量 THUMB_MAX，且是有意义的小数字
+ *   1. 并发上限自适应：默认 THUMB_MAX_LOW=6，仅按**成功**请求的往返中位数
+ *      放宽到 THUMB_MAX_HIGH（有上界）；失败请求不得计入链路估计
  *   2. 网格里的 <img> **不在 HTML 里写 src**，改由节流器按视口派发
  *   3. 存在观察器（离视口够近才入队）与队列/在传集合
  *   4. 灯箱打开 → 挂起并撤回在途缩略图；关闭 → 恢复
@@ -35,10 +36,28 @@ console.log('='.repeat(66));
 console.log('  前端缩略图节流 · 静态守卫（web/app.js）');
 console.log('='.repeat(66));
 
-// 1. 节流常量
-const mMax = src.match(/const\s+THUMB_MAX\s*=\s*(\d+)\s*;/);
-chk('定义 THUMB_MAX', !!mMax, mMax ? mMax[0] : '未找到');
-chk('THUMB_MAX 是小数字（1~8），不超过浏览器单源连接数', !!mMax && +mMax[1] >= 1 && +mMax[1] <= 8);
+// 1. 节流常量 + 自适应并发上限
+const mLow = src.match(/const\s+THUMB_MAX_LOW\s*=\s*(\d+)\s*;/);
+chk('定义 THUMB_MAX_LOW（低延迟默认上限）', !!mLow, mLow ? mLow[0] : '未找到');
+chk('THUMB_MAX_LOW = 6（浏览器单源连接数）', !!mLow && +mLow[1] === 6);
+const mHigh = src.match(/const\s+THUMB_MAX_HIGH\s*=\s*(\d+)\s*;/);
+chk('定义 THUMB_MAX_HIGH（高延迟上限）', !!mHigh, mHigh ? mHigh[0] : '未找到');
+chk('THUMB_MAX_HIGH 有合理上界（> LOW 且 ≤ 32）',
+  !!mHigh && !!mLow && +mHigh[1] > +mLow[1] && +mHigh[1] <= 32);
+chk('THUMB_MAX 默认取低延迟值（自适应起点保守）',
+  /let\s+THUMB_MAX\s*=\s*THUMB_MAX_FIXED\s*\|\|\s*THUMB_MAX_LOW\s*;/.test(src));
+chk('自适应有往返阈值 + 最少成功样本数',
+  /const\s+RTT_HIGH_MS\s*=\s*\d+\s*;/.test(src)
+  && /const\s+RTT_MIN_SAMPLES\s*=\s*\d+\s*;/.test(src));
+// 只有成功请求才计入链路估计：onload 采样、onerror 绝不采样
+const tsFn = src.match(/function\s+thumbStart\s*\([\s\S]*?\n\}/);
+const tsSrc = tsFn ? tsFn[0] : '';
+const onerrBlk = tsSrc.match(/img\.onerror\s*=\s*\(\)\s*=>\s*\{([\s\S]*?)\n  \};/);
+chk('只用成功请求估链路（onload 采样 / onerror 不采样）',
+  /img\.onload\s*=\s*\(\)\s*=>\s*\{[\s\S]{0,240}noteThumbRtt\(/.test(tsSrc)
+  && !!onerrBlk && !/noteThumbRtt/.test(onerrBlk[1]));
+chk('测试用并发覆盖 ?slthumbmax 存在且有上界',
+  /slthumbmax/.test(src) && /v\s*<=\s*32/.test(src));
 const mAhead = src.match(/const\s+THUMB_AHEAD\s*=\s*(\d+)\s*;/);
 chk('定义 THUMB_AHEAD（视口外预取余量）', !!mAhead, mAhead ? mAhead[0] : '未找到');
 

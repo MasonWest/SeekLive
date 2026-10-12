@@ -216,12 +216,25 @@ async function boot() {
   rearmObserver();                            // 用真实列数定下预加载余量
   syncTopbarHeight();
 
-  // ① 先问服务端「我是谁」——访问作用域的唯一权威来源。
-  //    匿名可读的只有「壳」，页面必须靠这一步才知道自己能看什么。
-  try { applySession(await api('/api/session')); }
-  catch (e) { splashFail('无法连接服务：' + e.message); return; }
+  // ① 首屏只问一次：身份 + 图库 + 时间轴 + 首日照片，服务端一次往返给全
+  //    （旧的 session→libs→tree→items 串行 4 步在高延迟链路上要多花 3 次往返）。
+  //    身份判定仍然**只**以服务端为准 —— 这里用的就是同一份 /api/session 载荷。
+  let b = null;
+  try { b = await api('/api/bootstrap'); }
+  catch (e) {
+    // 服务端还没升级时回退到旧的串行链路 —— 前端可以先于服务端上线，
+    // 滚动升级的中间状态不会把页面打死。
+    // ★ 老服务端对这个新路径给的不是 404：它不在旧版的匿名白名单里，
+    //   所以匿名访问会先被 read_guard 挡成 401；带上身份后才是 404。
+    //   而**新**服务端把 /api/bootstrap 列为匿名白名单、永远回 200 ——
+    //   因此 401/403/404 在这里只可能意味着「对面是旧版」。
+    if (e.status === 401 || e.status === 403 || e.status === 404) return bootLegacy();
+    splashFail('无法连接服务：' + e.message); return;
+  }
 
-  // ② 未授权访客：只给壳 + 入口，**不会**去请求任何相册数据。
+  applySession(b.session || {});
+
+  // ② 未授权访客：服务端此时**只回身份、不附任何相册数据**，所以这里必须早退。
   if (sess.scope === 'anon' && sess.protectRead) {
     // ?share=1 只是「我是点了分享链接过来的」这一**界面提示**，绝不是授权凭证
     // （授权一律由服务端 /api/session 判定）。有了它，才能把「链接失效」与
@@ -233,32 +246,55 @@ async function boot() {
     return;
   }
 
-  let d = null;
-  try {
-    d = await api('/api/libs');
-    state.libs = d.libraries || [];
-    if (d.trash && d.trash.retentionDays) trashDays = d.trash.retentionDays;
-    // /api/libs 也会带回权威作用域（在分享作用域下顺带拿到分享元信息）
-    if (d.scope) { sess.scope = d.scope; if (d.share) sess.share = d.share; }
-  } catch (e) {
-    splashFail('无法读取相册：' + e.message);
-    return;
-  }
-  applyScopeUI();
+  applyLibs(b.libs || {});
+  if (!afterLibs(b.libs || {})) return;
+  // 服务端已在同一次响应里附上首个库的 tree + 首日 items → 交给 selectLib 直接用，
+  // 不再各发一次请求。库不一致（或没带）时 pre=null，行为回到旧的「自己拉」。
+  const first = state.libs.filter(l => l.count > 0)[0];
+  const pre = (b.tree && b.lib === first.id) ? { tree: b.tree, items: b.items } : null;
+  await selectLib(first.id, true, null, pre);
+}
 
-  // 首次索引可能还在后台跑：不空等、不误报「没有照片」，而是显示进度面板。
-  if (d && (d.ready === false || d.indexing)) {
-    idxOpen();
+/* 老服务端（无 /api/bootstrap）的兜底首屏：与合并前完全一致地串行取数。
+   存在的意义只有一个 —— 让前端可以先于服务端上线，不至于把页面打死。 */
+async function bootLegacy() {
+  try { applySession(await api('/api/session')); }
+  catch (e) { splashFail('无法连接服务：' + e.message); return; }
+
+  if (sess.scope === 'anon' && sess.protectRead) {
+    if (QS.get('share')) { shareExpired(); return; }
+    splashAsk(sess.shareEnabled
+      ? '这个相册已开启访问保护。<br>请使用收到的分享链接，或输入管理口令。'
+      : '这个相册已开启访问保护。<br>请输入管理口令。');
     return;
   }
+  let d = null;
+  try { d = await api('/api/libs'); }
+  catch (e) { splashFail('无法读取相册：' + e.message); return; }
+  applyLibs(d);
+  if (!afterLibs(d)) return;
+  await selectLib(state.libs.filter(l => l.count > 0)[0].id, true);
+}
+
+/* libs 载荷 → 全局状态（两条首屏路径共用，避免第二套分流逻辑）。 */
+function applyLibs(d) {
+  state.libs = d.libraries || [];
+  if (d.trash && d.trash.retentionDays) trashDays = d.trash.retentionDays;
+  // /api/libs 也会带回权威作用域（在分享作用域下顺带拿到分享元信息）
+  if (d.scope) { sess.scope = d.scope; if (d.share) sess.share = d.share; }
+  applyScopeUI();
+}
+/* libs 之后的分流。返回 false 表示已处理（调用方应直接 return）。 */
+function afterLibs(d) {
+  if (d && (d.ready === false || d.indexing)) { idxOpen(); return false; }  // 首次索引进行中
   const usable = state.libs.filter(l => l.count > 0);
   if (!usable.length) {
     const anyExist = state.libs.some(l => l.exists);
     splashFail(anyExist ? '图库里没有可显示的图片' : '没有找到可用的图库目录，请编辑 libraries.json');
-    return;
+    return false;
   }
   buildChips(usable);
-  await selectLib(usable[0].id, true);
+  return true;
 }
 
 /* 未授权访客的落地页：复用 splash，附「输入管理口令」入口 */
@@ -318,7 +354,7 @@ function buildChips(libs) {
   if (libs.length < 2) box.style.display = 'none';
 }
 
-async function selectLib(id, isBoot = false, anchor = null) {
+async function selectLib(id, isBoot = false, anchor = null, pre = null) {
   if (state.lib === id && !isBoot) return;
   state.lib = id;
   state.switching = true;                  // 阻止哨兵在切库期间用旧索引渲染
@@ -342,7 +378,12 @@ async function selectLib(id, isBoot = false, anchor = null) {
   if (isBoot) $('#splash').classList.add('hide');
 
   try {
-    state.tree = await api('/api/tree', { lib: id });
+    // 首屏：tree 已随 /api/bootstrap 一起拿到（且库对得上）→ 不再单独发一次请求。
+    if (pre && pre.tree && pre.tree.lib && pre.tree.lib.id === id) {
+      state.tree = pre.tree;
+    } else {
+      state.tree = await api('/api/tree', { lib: id });
+    }
   } catch (e) {
     state.switching = false;
     if ((e.status === 401 || e.status === 403) && IS_SHARE()) {
@@ -368,6 +409,11 @@ async function selectLib(id, isBoot = false, anchor = null) {
   if (!state.days.length) {
     $('#denCtl').hidden = true;
     renderEmpty('暂无图片', '这个图库里还没有可显示的图片。'); return;
+  }
+  // 首日照片也已随 bootstrap 拿到 → 先塞进缓存，loadDay 便不必再发一次请求。
+  // （键必须与 loadDay 用的 day.key 完全一致，否则等于没塞。）
+  if (pre && pre.items && pre.items.items && !state.items.has(state.days[0].key)) {
+    state.items.set(state.days[0].key, pre.items.items);
   }
   $('#denCtl').hidden = false;                // 时间轴出来了，密度控制器才露面
   syncDen();
@@ -555,13 +601,55 @@ async function loadDay(el) {
      · 由观察器判定「离视口够近」才入队（取代 loading=lazy，避免双重延迟）
      · 同时最多 THUMB_MAX 个在传 —— 滚得再快也攒不出几百个积压
      · 打开灯箱时整体挂起，并撤回在途请求，连接池全部让给大图
+
+   ★ 并发上限自适应（2026-10-12）：
+     6 是 **HTTP/1.1「同源 6 连接」的硬限制**，LAN / EasyTier 下这是正确上限；
+     但在 CF Tunnel / 公网这类高延迟链路上，浏览器↔CDN 走 HTTP/2 多路复用、
+     没有 6 连接限制，此时 6 反而成了**人为的串行瓶颈**。
+     所以上限按**实测往返延迟**决定，绝不按协议/域名猜：
+       · 默认 THUMB_MAX_LOW（=6）—— 局域网、EasyTier 的现有体验完全不变；
+       · 仅当**成功**缩略图请求的往返**中位数** > RTT_HIGH_MS 时放宽到 THUMB_MAX_HIGH；
+       · **失败 / 中断的请求一律不计入样本** —— 一次失败不足以改变链路判断；
+       · 样本不足 RTT_MIN_SAMPLES 之前保持默认（宁可保守）；
+       · 中位数会在滑动窗口里随后的样本里回落 → 误判会自行纠正回 6。
    ===================================================== */
-const THUMB_MAX = 6;
+const THUMB_MAX_LOW = 6;              // 低延迟链路（LAN / EasyTier）：HTTP/1.1 单源上限
+const THUMB_MAX_HIGH = 20;            // 高延迟链路（隧道 / 公网）：多路复用下可放宽
+const RTT_HIGH_MS = 500;              // 往返中位数超过它才认定「高延迟」
+const RTT_MIN_SAMPLES = 6;            // 至少这么多个**成功**样本才敢改判
+const THUMB_RTT_WINDOW = 24;          // 滑动窗口长度（中位数只受最近样本影响）
+/* 仅供性能测试用：?slthumbmax=N 固定并发上限（越界/非法 → 0 = 走自适应）。
+   纯前端、不参与任何鉴权；方便在真实链路上 A/B 对比 6 / 12 / 20。 */
+const THUMB_MAX_FIXED = (() => {
+  const v = parseInt(QS.get('slthumbmax'), 10);
+  return (v > 0 && v <= 32) ? v : 0;
+})();
+let THUMB_MAX = THUMB_MAX_FIXED || THUMB_MAX_LOW;
+const thumbRtt = [];                  // 成功请求的往返耗时样本（ms）
+
+function noteThumbRtt(ms) {
+  if (!(ms > 0) || !isFinite(ms)) return;          // 失败/中断：不记
+  thumbRtt.push(ms);
+  if (thumbRtt.length > THUMB_RTT_WINDOW) thumbRtt.shift();
+  if (THUMB_MAX_FIXED || thumbRtt.length < RTT_MIN_SAMPLES) return;
+  const s = thumbRtt.slice().sort((a, b) => a - b);
+  const median = s[s.length >> 1];
+  const want = median > RTT_HIGH_MS ? THUMB_MAX_HIGH : THUMB_MAX_LOW;
+  if (want !== THUMB_MAX) { THUMB_MAX = want; thumbPump(); }
+}
+
 const THUMB_AHEAD = 600;              // 视口外多远开始预取（px）
 const thumbQueue = [];                // 待发元素
 const thumbWaiting = new Set();       // 已入队（防重复）
 const thumbLive = new Set();          // 在传
 let thumbHeld = false;                // 灯箱打开时挂起
+
+/* 诊断用（只读）：当前并发上限与链路估计，便于回答「为什么并发是这个数」 */
+window.__slThumbNet = () => {
+  const s = thumbRtt.slice().sort((a, b) => a - b);
+  return { max: THUMB_MAX, fixed: THUMB_MAX_FIXED, samples: s.length,
+           median: s.length ? Math.round(s[s.length >> 1]) : null };
+};
 
 const thumbObserver = new IntersectionObserver(entries => {
   entries.forEach(e => {
@@ -590,9 +678,11 @@ function thumbPump() {
 function thumbStart(img) {
   thumbLive.add(img);
   const tile = img.closest('.tile');
+  const t0 = performance.now();
   img.onload = () => {
     img.onload = img.onerror = null;
     thumbLive.delete(img);
+    noteThumbRtt(performance.now() - t0);      // 只用**成功**请求估链路延迟
     if (tile) tile.classList.add('loaded');
     fitTile(img);
     thumbPump();
