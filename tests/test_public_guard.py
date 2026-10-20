@@ -4,7 +4,7 @@
 SeekLive · 公网 Tunnel 安全加固 —— 服务端封锁自测（hermetic）
 ============================================================
 
-背景：Cloudflare Tunnel 把 share.qqtang-match.fun 指向本机 localhost:9000。
+背景：Cloudflare Tunnel 把 photos.example.com 指向本机 localhost:9000。
 cloudflared 与本服务**同机**运行 → 隧道请求的 TCP 对端必然是回环地址；同时
 cloudflared / CF 边缘必带 X-Forwarded-Proto / X-Forwarded-For /
 CF-Connecting-IP 等头，Host 原样透传公网域名。服务端据此把「公网请求」的
@@ -50,7 +50,7 @@ import cache_db          # noqa: E402
 
 PASS, FAIL, SKIPS = [], [], []
 
-PUBLIC_HOST = "share.qqtang-match.fun"          # admin.json → publicUrl 的公网域名
+PUBLIC_HOST = "photos.example.com"          # admin.json → publicUrl 的公网域名
 PUBLIC_URL = "https://" + PUBLIC_HOST
 TOKEN = "test-pw-123"
 

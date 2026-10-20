@@ -1,4 +1,24 @@
 /* 正式版 UI 端到端验收（真实 Chromium/Edge） */
+/* ============================================================================
+ * ⚠️ DEPRECATED（已废弃）—— 默认拒绝运行，避免误跑破坏真实数据
+ * ----------------------------------------------------------------------------
+ * 本脚本口径已过时（断言「匿名 /api/libs → 200」、图库 id 写死等），对当前版本会误报；
+ * 且带 TOKEN 时会对**真实服务**执行真删 / 真恢复，可能破坏你的真实图库。
+ *
+ *   ✅ 请改用：node tests/e2e/qa_share.js        （自带隔离夹具，不碰真实图库）
+ *            node tests/e2e/qa_keep_scroll.js   （只跑重建路径，不真删图）
+ *
+ * 如确需在「可随时丢弃的测试实例」上运行，显式设置环境变量再执行：
+ *   SEEKLIVE_VERIFY_UI_ALLOW=1 node tests/e2e/verify_ui.js
+ * ========================================================================== */
+if (process.env.SEEKLIVE_VERIFY_UI_ALLOW !== '1') {
+  console.error('\n[已阻止] tests/e2e/verify_ui.js 已废弃，且会对真实服务执行破坏性操作。');
+  console.error('  请改用 tests/e2e/qa_share.js（隔离夹具）或 qa_keep_scroll.js。');
+  console.error('  确需运行：SEEKLIVE_VERIFY_UI_ALLOW=1 node tests/e2e/verify_ui.js');
+  console.error('  并确保目标是可以随时丢弃的测试实例。\n');
+  process.exit(2);
+}
+
 const { chromium, request } = require('playwright-core');
 const fs = require('fs');
 const os = require('os');

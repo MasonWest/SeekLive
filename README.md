@@ -297,7 +297,7 @@ python server.py --rebuild-index :: 丢弃索引重建
 
 ### 5.7 公网访问时禁用全部管理员功能（Cloudflare Tunnel）
 
-项目通过 Cloudflare Tunnel（如 `share.qqtang-match.fun`）暴露到公网时，服务端会**自动识别**
+项目通过 Cloudflare Tunnel（如 `photos.example.com`）暴露到公网时，服务端会**自动识别**
 公网请求，并在任何口令验证、会话创建之前直接拒绝全部管理员功能：
 
 - **判定方式（不可被客户端伪造）**，满足其一即视为公网请求：
@@ -599,7 +599,6 @@ node tests/check_frontend_thumb.mjs # 前端缩略图调用链静态守卫（无
 node tests/check_frontend_thumbs.mjs # 缩略图节流 / 灯箱让路 + 并发自适应静态守卫（无需浏览器）
 node tests/check_frontend_boot.mjs # 首屏合并 /api/bootstrap 静态守卫（无需浏览器）
 node tests/check_frontend_density.mjs # 照片墙五档密度 / 时间层级 / 单档契约 静态守卫
-node tests/e2e/verify_ui.js        # 端到端（需先启动服务；Playwright + 本机 Chromium）
 node tests/e2e/qa_live_lightbox.js # 实况灯箱：静图/动图同框 + 声音开关 + 三种条目回归
 node tests/e2e/qa_keep_scroll.js   # 删除/恢复后保持浏览位置（不真删图：只跑重建路径）
 node tests/e2e/qa_share.js         # 访问控制 / 分享浏览器回归（自带隔离夹具，不碰真实图库）
