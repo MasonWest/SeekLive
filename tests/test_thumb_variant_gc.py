@@ -68,11 +68,13 @@ def setup():
         f.write(b"IMG-A" * 100)
     with open(os.path.join(SRC, "clip.mp4"), "wb") as f:
         f.write(b"VID-CLIP" * 500)
+    S.META["cache"] = {"temporaryGraceSeconds": 0}
     S.CACHE_DIR = CACHE
     S.CACHE_INDEX = cache_db.CacheIndex(os.path.join(T, "cache.db"))
     S.INDEX = index_db.Index(os.path.join(T, "index.db"))
     S.TRASH = _FakeTrash()
     S.META = {
+        "cache": {"temporaryGraceSeconds": 0},
         "lib_order": ["lib_a"],
         "libs": {"lib_a": {"name": "测试库", "root": SRC, "exists": True,
                            "stale": False, "count": 2, "live": 0,

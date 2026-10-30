@@ -22,7 +22,7 @@ SeekLive · 缓存清单（cache manifest）
 本模块是**纯存储层**，自身不删除任何文件。
 实际的删除动作在 ``server.py`` 的 ``cache_gc_apply()`` 里，并且必须满足：
   1. 目标路径 ``realpath`` 必须位于 ``cache/`` 目录之内（双重前缀校验）；
-  2. 只允许删除清单里被判定为孤儿的缓存文件；
+  2. 删除已确认的孤儿，或容量策略选中的可重建缓存；
   3. **绝不触碰源照片 / 源视频目录**。
 
 换句话说：清缓存与删原图是两条完全独立的路径，前者不可能影响后者。
@@ -48,7 +48,7 @@ import time
 import sqlite3
 import threading
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -94,8 +94,13 @@ class CacheIndex:
             pass
         with self._lock:
             self.conn.executescript(_SCHEMA)
+            columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(entries)")}
+            if "last_access" not in columns:
+                self.conn.execute("ALTER TABLE entries ADD COLUMN last_access INTEGER NOT NULL DEFAULT 0")
+                self.conn.execute("UPDATE entries SET last_access=created")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS ix_entries_access ON entries(kind,last_access)")
             self.conn.execute(
-                "INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', ?)",
+                "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),))
             self.conn.commit()
 
@@ -137,7 +142,7 @@ class CacheIndex:
                 "  lib_id=excluded.lib_id, rel=excluded.rel, "
                 "  src_mtime=excluded.src_mtime, src_size=excluded.src_size, "
                 "  kind=excluded.kind, variant=excluded.variant, "
-                "  bytes=excluded.bytes, created=excluded.created", row)
+                "  bytes=excluded.bytes", row)
             self.conn.commit()          # ★ 必须提交，否则单条写入会一直挂在未提交事务里
 
     def record_batch(self, rows):
@@ -162,8 +167,16 @@ class CacheIndex:
         with self._lock:
             cur = self.conn.execute(
                 "SELECT key, lib_id, rel, src_mtime, src_size, kind, variant, "
-                "bytes, created FROM entries")
+                "bytes, created, last_access FROM entries")
             return [dict(r) for r in cur]
+
+    def touch_many(self, accesses):
+        if not accesses:
+            return
+        with self._lock:
+            self.conn.executemany("UPDATE entries SET last_access=MAX(last_access,?) WHERE key=?",
+                                  [(ts, key) for key, ts in accesses.items()])
+            self.conn.commit()
 
     def all_keys(self):
         with self._lock:

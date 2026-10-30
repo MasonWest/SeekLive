@@ -343,8 +343,8 @@ def run_matrix(base):
     st, hd, _ = req(base, "/thumb?lib=t&p=" + urllib.parse.quote(R[0]) + "&s=640",
                     cookies=ck_admin)
     chk("管理员 /thumb → 200", st == 200, f"HTTP {st}")
-    chk("管理员媒体响应头仍是 public（不改缓存策略）",
-        "public" in (hd.get("Cache-Control") or ""), hd.get("Cache-Control") or "")
+    chk("管理员受保护媒体禁止浏览器及共享缓存存储",
+        "private" in (hd.get("Cache-Control") or "") and "no-store" in (hd.get("Cache-Control") or ""), hd.get("Cache-Control") or "")
     st, _, _ = req(base, "/video?lib=t&p=" + urllib.parse.quote(MOV2),
                    headers={"Range": "bytes=0-99"}, cookies=ck_admin)
     chk("管理员 /video Range → 206", st == 206, f"HTTP {st}")

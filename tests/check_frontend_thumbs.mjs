@@ -85,7 +85,7 @@ chk('有等待集合 thumbWaiting', /const\s+thumbWaiting\s*=\s*new Set\(\)/.tes
 chk('有队列 thumbQueue', /const\s+thumbQueue\s*=\s*\[\]/.test(src));
 chk('派发受 THUMB_MAX 限制',
   /while\s*\(\s*thumbLive\.size\s*<\s*THUMB_MAX\s*&&\s*thumbQueue\.length\s*\)/.test(src));
-chk('thumbStart 里才写 src', /img\.src\s*=\s*img\.dataset\.thumbUrl/.test(src));
+chk('thumbStart 里才写 src', /img\.src\s*=\s*thumbRequestURL\(img\.dataset\.thumbUrl\)/.test(src));
 chk('load 后才加 .loaded 并 fitTile',
   /tile\.classList\.add\('loaded'\)[\s\S]{0,40}fitTile\(img\)/.test(src));
 

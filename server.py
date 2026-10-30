@@ -489,8 +489,16 @@ def gen_gate(foreground=False):
     with _bg_wait_lock:
         _bg_waiting += 1
     try:
-        with _gen_sem:
+        acquired = False
+        try:
+            while not acquired:
+                thumb_work.check()
+                acquired = _gen_sem.acquire(timeout=0.05)
+            thumb_work.check()
             yield
+        finally:
+            if acquired:
+                _gen_sem.release()
     finally:
         with _bg_wait_lock:
             _bg_waiting -= 1
@@ -505,6 +513,25 @@ def bump(k, n=1):
 #  缓存清单：记录「哪个缓存文件是谁生成的」
 #  —— 有了它，缓存才可被安全回收（见 cache_gc_plan / cache_gc_apply）
 # =========================================================
+import thumb_work
+import cache_policy
+_cache_governor = None
+_cache_governor_lock = threading.Lock()
+
+
+def cache_governor():
+    global _cache_governor
+    with _cache_governor_lock:
+        if (_cache_governor is None or _cache_governor.root != os.path.realpath(CACHE_DIR)
+                or _cache_governor.store is not CACHE_INDEX):
+            _cache_governor = cache_policy.Governor(CACHE_DIR, CACHE_INDEX)
+        return _cache_governor
+
+
+def cache_config():
+    return cache_policy.config(META.get("cache"))
+
+
 _recorded_memo = set()
 _recorded_memo_lock = threading.Lock()
 
@@ -513,6 +540,7 @@ def cache_record(key, lib_id, rel, st, kind, variant, bytes_):
     """把一个缓存文件的来源写进清单。带内存去重，避免每次命中都写库。"""
     if CACHE_INDEX is None or not key:
         return
+    cache_governor().touch(key)
     with _recorded_memo_lock:
         if key in _recorded_memo:
             return
@@ -1198,7 +1226,7 @@ def _is_link_like(path):
     return False
 
 
-def walk_files(root, ignore=None, ignore_hidden=True, on_progress=None):
+def walk_files(root, ignore=None, ignore_hidden=True, on_progress=None, strict=False):
     """
     递归列举 (relpath, name, size, mtime)，只 stat 不读内容。
 
@@ -1209,11 +1237,12 @@ def walk_files(root, ignore=None, ignore_hidden=True, on_progress=None):
       · 跳过系统/工具目录（.git / node_modules / @eaDir / $RECYCLE.BIN …）
       · 跳过符号链接与 junction（含指向祖先目录的链接，避免无限递归）
       · 无权限目录 / 单个条目 stat 失败 → 静默跳过该条目，不中断整次扫描
-      · 根目录本身不可读 → 返回空列表（由上层决定是「空图库」还是「保留旧索引」）
+      · strict=True 时任意读取错误都会在返回前抛出，禁止以不完整结果清理索引
 
     on_progress(n)：低频回调（仅用于索引进度面板的「已发现 N 个文件」，
     纯计数、不参与百分比计算）。默认 None → 行为与改造前完全一致。
     """
+    errors = []
     out = []
     ignore = set(ignore or ())
     root = os.path.abspath(root)
@@ -1246,11 +1275,15 @@ def walk_files(root, ignore=None, ignore_hidden=True, on_progress=None):
                             out.append((rel, e.name, st.st_size, st.st_mtime))
                             if on_progress is not None:
                                 on_progress(len(out))
-                    except OSError:
+                    except OSError as exc:
+                        errors.append((e.path, exc))
                         continue
-        except OSError:
+        except OSError as exc:
+            errors.append((d, exc))
             # 无权限 / 目录消失 / 设备暂时不可用：跳过该目录，继续其余部分
             continue
+    if strict and errors:
+        raise OSError(f"扫描不完整：{len(errors)} 处读取失败；首处 {errors[0][0]}: {errors[0][1]}")
     return out
 
 
@@ -1399,13 +1432,16 @@ def scan_library(lib, full=False, lib_index=0, lib_total=0, report=True):
     ignore = set(IGNORE_DIRS) | set(lib.get("ignore") or [])
     ignore_hidden = lib.get("_ignoreHidden", META["scan"].get("ignoreHidden", True))
 
-    if full:
-        idx.reset_lib(lid)
-
     if report:
         idx_counting(lib, lib_index, lib_total)
-    listed = walk_files(root, ignore=ignore, ignore_hidden=ignore_hidden,
-                        on_progress=(idx_counting_tick if report else None))
+    try:
+        listed = walk_files(root, ignore=ignore, ignore_hidden=ignore_hidden,
+                            on_progress=(idx_counting_tick if report else None), strict=True)
+    except OSError:
+        lib["stale"] = True
+        raise
+    if full:
+        idx.reset_lib(lid)
     if report:
         idx_scanning(lib, len(listed))
     idx.touch_lib(lid, lib["name"], root)
@@ -1618,6 +1654,7 @@ def load_libraries(full=False, mode="startup"):
 
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
+    META["cache"] = cache_policy.config(cfg.get("cache"))
     libs = cfg.get("libraries") or DEFAULT_LIBS
 
     scan_cfg = dict(DEFAULT_SCAN)
@@ -1682,8 +1719,9 @@ def load_libraries(full=False, mode="startup"):
             except Exception as e:
                 log.exception("扫描 %s 失败", lid)
                 idx_error(entry, f"{entry['name']} 扫描失败：{e}")
-                _empty_entry(entry)
-                print(f"       [错误] 扫描失败：{e}")
+                sync_memory(entry)
+                entry["stale"] = True
+                print(f"       [错误] 扫描失败，保留已有索引：{e}")
             else:
                 flag = "" if not entry.get("movParsed") else f" ｜ 重解析 MOV {entry['movParsed']} 个"
                 print(f"       {entry['count']:,} 项 / Live {entry['live']} 组 "
@@ -2930,7 +2968,7 @@ def cache_key(rel, mtime, size, kind, extra="", lib_id=""):
     缓存键 = sha256(lib_id | rel | mtime | size | kind | CACHE_VERSION | extra)
     ★ lib_id 参与哈希 → 不同图库下的同名文件互不串用（多图库身份隔离）。
     """
-    raw = f"{lib_id}|{rel}|{int(mtime)}|{size}|{kind}|{CACHE_VERSION}|{extra}"
+    raw = f"{lib_id}|{rel}|{mtime!r}|{size}|{kind}|{CACHE_VERSION}|{extra}"
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return h[:2], h[2:4], h
 
@@ -2943,27 +2981,27 @@ def cache_path(shard1, shard2, h, ext=".cache"):
 
 
 def single_flight(key, producer):
+    # Publish a completion object, never an unlocked mutex.
+    from concurrent.futures import Future
     with _inflight_guard:
-        lock = _inflight.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _inflight[key] = lock
-            owner = True
-        else:
-            owner = False
-    if owner:
-        try:
-            with lock:
-                data = producer()
-            return data, True
-        finally:
-            with _inflight_guard:
-                _inflight.pop(key, None)
-    else:
+        future = _inflight.get(key)
+        owner = future is None
+        if owner:
+            future = Future()
+            _inflight[key] = future
+    if not owner:
         bump("singleflight_wait")
-        with lock:
-            pass
-        return None, False
+        return future.result(), False
+    try:
+        data = producer()
+        future.set_result(data)
+        return data, True
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _inflight_guard:
+            _inflight.pop(key, None)
 
 
 # =========================================================
@@ -3157,7 +3195,14 @@ def render_media(fullpath, max_side, quality, fmt):
     return gen_image(fullpath, max_side, quality, fmt)
 
 
-def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="",
+def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="", fg=False):
+    h = cache_key(rel, st.st_mtime, st.st_size, kind + fmt + str(max_side),
+                  extra, lib_id=lib["id"])[2]
+    with cache_governor().pin(cache_path(h[:2], h[2:4], h)):
+        return _cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra, fg)
+
+
+def _cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="",
                  fg=False):
     """带磁盘缓存 + 单飞的媒体生成（图片转码 / 视频抽帧）。返回 (bytes, mime, hit)
 
@@ -3182,14 +3227,27 @@ def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="",
             data, mime, _, _ = render_media(fullpath, max_side, quality, fmt)
         os.makedirs(os.path.dirname(cp), exist_ok=True)
         tmp = cp + f".{secrets.token_hex(4)}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, cp)
+        try:
+            with cache_governor().reserve(len(data), cache_config()):
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, cp)
+        finally:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
         cache_record(h, lib["id"], rel, st, kind, variant, len(data))
         bump("gen")
         return data, mime
 
-    res, is_new = single_flight(kind + h, produce)
+    while True:
+        try:
+            res, is_new = single_flight(kind + h, produce)
+            break
+        except thumb_work.Superseded:
+            # A current viewer may have joined an obsolete owner's single-flight.
+            # Retry its demand rather than inheriting the old viewer's cancellation.
+            thumb_work.check()
+            time.sleep(0.01)
     if res is None:                      # 等待者：读磁盘
         with open(cp, "rb") as f:
             data = f.read()
@@ -3198,9 +3256,35 @@ def cached_image(lib, rel, fullpath, st, kind, max_side, quality, fmt, extra="",
 
 
 # ---------- 视频转码 / faststart ----------
+_transcode_sem = threading.BoundedSemaphore(1)
+
+
 def build_transcode(src, lib_id="", rel=""):
     st = os.stat(src)
-    key = hashlib.sha256(f"tc3|{src}|{int(st.st_mtime)}|{st.st_size}".encode()).hexdigest()
+    key = hashlib.sha256(f"tc4|{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    with cache_governor().pin(cache_file_for(key, "trans")):
+        return _leased_transcode(src, lib_id, rel)
+
+
+def _leased_transcode(src, lib_id="", rel=""):
+    st = os.stat(src)
+    identity = (os.path.realpath(src), st.st_mtime_ns, st.st_size)
+    key = hashlib.sha256(f"tc4|{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    out = os.path.join(CACHE_DIR, "trans", key[:2], key + ".mp4")
+    if os.path.isfile(out):
+        return _build_transcode(src, lib_id, rel)
+    def produce():
+        with _transcode_sem:
+            # Conservative estimate; other processes can still consume disk space.
+            estimate = max(32 * 1024 * 1024, st.st_size * 3)
+            with cache_governor().reserve(estimate, cache_config()):
+                return _build_transcode(src, lib_id, rel)
+    return single_flight("transcode:" + repr(identity), produce)[0]
+
+
+def _build_transcode(src, lib_id="", rel=""):
+    st = os.stat(src)
+    key = hashlib.sha256(f"tc4|{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
     out = os.path.join(CACHE_DIR, "trans", key[:2], key + ".mp4")
     if os.path.isfile(out):
         cache_record(key, lib_id, rel, st, "trans",
@@ -3210,7 +3294,7 @@ def build_transcode(src, lib_id="", rel=""):
     if not ffm:
         return None, False
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    tmp = out + f".{os.getpid()}.tmp.mp4"
+    tmp = out + f".{secrets.token_hex(8)}.tmp.mp4"
     cmd = [ffm, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
@@ -3688,6 +3772,17 @@ def _gc_collect(classes=None, force=True, full=None):
     protected = 0
     for path, size in files.items():
         name = os.path.basename(path)
+        governor = cache_governor()
+        if governor.protected(path):
+            protected += 1
+            continue
+        if ".tmp" in name.lower() or _key_of_cache_name(name) not in entries:
+            try:
+                if time.time() - os.path.getmtime(path) < cache_config()["temporaryGraceSeconds"]:
+                    protected += 1
+                    continue
+            except OSError:
+                continue
         if ".tmp" in name.lower():
             items.append({"path": path, "size": size, "cls": "tmp_leak",
                           "kind": "", "why": "未完成的生成/转码残留"})
@@ -3773,6 +3868,11 @@ def _gc_collect(classes=None, force=True, full=None):
 
     # 过滤出用户要求的类别
     picked = [it for it in items if it["cls"] and it["cls"] in want]
+    for it in picked:
+        try:
+            it["mtime_ns"] = os.stat(it["path"]).st_mtime_ns
+        except OSError:
+            it["mtime_ns"] = -1
     return (picked, ghost, protected, len(files), sum(files.values()),
             len(empty_dirs), thr, kinds)
 
@@ -3831,6 +3931,11 @@ def cache_gc_plan(classes=None, force=True, full=None):
 
 
 def cache_gc_apply(classes=None, full=None):
+    with cache_governor().maintenance:
+        return _cache_gc_apply(classes, full)
+
+
+def _cache_gc_apply(classes=None, full=None):
     """
     执行清理：**只删除 cache/ 目录内的孤儿缓存文件**。
     每一处删除前都做 realpath 前缀双校验；源照片目录永远不在删除范围内。
@@ -3906,11 +4011,17 @@ def cache_gc_apply(classes=None, full=None):
                     continue
             # tmp_leak：文件名即判据，无需核验
             sz = os.path.getsize(rp)
-            os.remove(rp)
+            with cache_governor().lock:
+                if not cache_governor().remove(rp, sz, it.get("mtime_ns")):
+                    skipped += 1
+                    continue
+                if CACHE_INDEX is not None:
+                    CACHE_INDEX.delete_keys([key])
+                with _recorded_memo_lock:
+                    _recorded_memo.discard(key)
             deleted += 1
             freed += sz
             if CACHE_INDEX is not None:
-                removed_keys.append(key)
                 with _recorded_memo_lock:
                     _recorded_memo.discard(key)
         except FileNotFoundError:
@@ -3925,7 +4036,11 @@ def cache_gc_apply(classes=None, full=None):
             if removed_keys:
                 CACHE_INDEX.delete_keys(removed_keys)
             if ghost:
-                ghost_removed = CACHE_INDEX.delete_keys(ghost)
+                with cache_governor().lock:
+                    ghost = [k for k in ghost if k in live and
+                             not cache_governor().protected(cache_file_for(k, live[k]["kind"])) and
+                             not os.path.isfile(cache_file_for(k, live[k]["kind"]))]
+                    ghost_removed = CACHE_INDEX.delete_keys(ghost)
                 with _recorded_memo_lock:
                     for k in ghost:
                         _recorded_memo.discard(k)
@@ -3948,6 +4063,92 @@ def cache_gc_apply(classes=None, full=None):
             "skipped": skipped,
             "errors": errors[:20],
             "modes": {"dry": False}}
+
+
+def cache_capacity_apply():
+    """Optional automatic eviction. Only known, reproducible cache files qualify."""
+    governor = cache_governor()
+    cfg = cache_config()
+    with governor.maintenance:
+        governor.flush()
+        if not cfg["maxGB"] or CACHE_INDEX is None:
+            governor.last = {"enabled": False}
+            return governor.last
+        files = _scan_cache(force=True)[0]
+        total = sum(files.values())
+        free = governor.disk_free()
+        maximum = cfg["maxGB"] * cache_policy.GIB
+        if total < maximum and free >= cfg["minFreeGB"] * cache_policy.GIB:
+            governor.last = {"enabled": True, "at": int(time.time()), "deleted": 0,
+                             "bytes": 0, "usageBytes": total, "blocked": False}
+            return governor.last
+        # Invalid cache first; fresh temporary files and active files remain protected.
+        orphan = cache_gc_apply()
+        files = _scan_cache(force=True)[0]
+        total = sum(files.values())
+        free = governor.disk_free()
+        entries = []
+        for row in CACHE_INDEX.all_entries():
+            if not re.fullmatch(r"[0-9a-f]{64}", row["key"]) or row["kind"] not in cache_db.VALID_KINDS:
+                continue
+            path = cache_file_for(row["key"], row["kind"])
+            if path not in files or not governor.within(path) or os.path.islink(path):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            try:
+                lib = META["libs"].get(row["lib_id"])
+                eligible = bool(lib and lib.get("exists", True) and not lib.get("stale"))
+                if eligible:
+                    source = os.stat(safe_resolve(lib["root"], row["rel"]))
+                    eligible = source.st_size == row["src_size"] and source.st_mtime == row["src_mtime"]
+            except OSError:
+                eligible = False
+            except SecurityError:
+                eligible = False
+            row.update(path=path, bytes=st.st_size, mtime_ns=st.st_mtime_ns,
+                       eligible=eligible and not governor.protected(path))
+            entries.append(row)
+        victims, needed = cache_policy.choose_victims(entries, total, free, cfg, pressure=True)
+        deleted = freed = 0
+        for row in victims:
+            path, key = row["path"], row["key"]
+            try:
+                with governor.lock:
+                    # Pending touches protect photos revisited after the plan was made.
+                    if key in governor.pending or not governor.remove(path, row["bytes"], row["mtime_ns"]):
+                        continue
+                    CACHE_INDEX.delete_keys([key])
+                    with _recorded_memo_lock:
+                        _recorded_memo.discard(key)
+                deleted += 1
+                freed += row["bytes"]
+            except OSError as exc:
+                log.warning("容量回收跳过 %s: %s", key, exc)
+        _scan_cache_invalidate()
+        governor.last = {"enabled": True, "at": int(time.time()),
+                         "deleted": deleted + orphan["deleted"],
+                         "bytes": freed + orphan["bytes"], "usageBytes": total - freed,
+                         "neededBytes": needed, "blocked": freed < needed}
+        return dict(governor.last)
+
+
+def cache_maintenance_loop():
+    while not _recheck_stop.is_set():
+        try:
+            result = cache_capacity_apply()
+            if result.get("blocked"):
+                log.warning("缓存容量回收受限：活跃文件、新文件或受保护图库占用空间")
+        except Exception:
+            log.exception("缓存治理失败，将在下一轮重试")
+        if _recheck_stop.wait(cache_config()["checkIntervalSeconds"]):
+            break
+    try:
+        cache_governor().flush()
+    except Exception:
+        log.exception("缓存访问记录保存失败")
 
 
 def probe_codec(src):
@@ -4172,7 +4373,8 @@ class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self):
         self._scope = None        # 身份判定的单请求缓存（read_scope）
         self._body_raw = None     # POST 预读的请求体缓存
-        return super().handle_one_request()
+        with cache_governor().request():
+            return super().handle_one_request()
 
     def log_message(self, fmt, *a):
         # ★ 分享令牌会出现在 /s/<token> 的请求行里 —— 日志一律脱敏，
@@ -4325,7 +4527,7 @@ class Handler(BaseHTTPRequestHandler):
     # 分享访客可读的路径；**具体到哪一张**由 media_guard / share_lib_view 逐条判定。
     SHARE_GET = frozenset({
         "/api/libs", "/api/tree", "/api/items", "/api/search", "/api/item",
-        "/thumb", "/photo", "/raw", "/video",
+        "/thumb", "/photo", "/raw", "/video", "/api/thumb/view",
     })
 
     def read_guard(self, path):
@@ -4413,9 +4615,9 @@ class Handler(BaseHTTPRequestHandler):
                 else (401, "需要访问授权"))
 
     def media_cache(self, default):
-        """媒体缓存策略：share 一律 private,no-store（撤销要即时生效）；admin 保持 public。"""
+        """受保护媒体禁止浏览器及共享缓存存储；磁盘生成缓存不受影响。"""
         scope, _ = self.read_scope()
-        return "private, no-store" if scope == "share" else default
+        return "private, no-store" if ACCESS_PROTECT or scope == "share" else default
 
     def share_cookie_value(self, tok, rec):
         """组装 sl_share：Path=/ 必须（否则 /thumb 等非子目录请求带不上 Cookie）。"""
@@ -4455,6 +4657,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_share_landing(path[3:])
 
         # ---- API ----
+        if path == "/api/thumb/view":
+            if self.command != "HEAD":
+                self.thumb_demand(qs)
+            return self.send_json({"ok": True})
         if path == "/api/session":
             return self.api_session()
         if path == "/api/bootstrap":
@@ -5347,6 +5553,8 @@ class Handler(BaseHTTPRequestHandler):
             d["files"] += 1
             d["bytes"] += s
         return self.send_json({
+            "policy": cache_config(),
+            "governance": dict(cache_governor().last),
             "cacheDir": CACHE_DIR,
             "total": {"files": img["files"] + tr["files"],
                       "bytes": img["bytes"] + tr["bytes"]},
@@ -5450,6 +5658,13 @@ class Handler(BaseHTTPRequestHandler):
         rel = (qs.get("p") or [""])[0]
         return self.media_guard(lib, rel) or (None, None)
 
+    def thumb_demand(self, qs):
+        scope, rec = self.read_scope()
+        # Namespaced by authenticated identity: tabs and visitors cannot cancel each other.
+        identity = (scope, self.cookie_val(SHARE_COOKIE) if scope == "share" else self.admin_sid())
+        return thumb_work.views.register(identity, (qs.get("_slview") or [""])[0],
+                                         (qs.get("_slepoch") or [""])[0])
+
     def serve_image(self, qs, kind):
         code, msg = self._media_precheck(qs)
         if code:
@@ -5470,8 +5685,17 @@ class Handler(BaseHTTPRequestHandler):
             fg = True                          # 大图是用户正等的 → 前台道
         try:
             st = os.stat(fp)
-            data, mime, hit = cached_image(lib, rel, fp, st, kind,
-                                           side, quality, fmt, fg=fg)
+            cancelled = self.thumb_demand(qs) if kind == "thumb" and self.command != "HEAD" else None
+            with thumb_work.demand(cancelled):
+                thumb_work.check()
+                data, mime, hit = cached_image(lib, rel, fp, st, kind,
+                                               side, quality, fmt, fg=fg)
+        except thumb_work.Superseded:
+            bump("thumb_superseded")
+            return self.send_bytes(b"", "image/webp", 409,
+                                   extra={"X-Thumbnail-State": "superseded"})
+        except cache_policy.CacheSpaceError as e:
+            return self.send_err(507, str(e))
         except Exception as e:
             log.error("gen fail %s: %s", rel, e)
             return self.send_err(500, f"处理失败: {e}")
@@ -5520,7 +5744,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_err(
                     415, f"视频 {mb:.0f}MB 超过在线转码上限 "
                          f"({MAX_TRANSCODE_MB}MB)，请下载后本地播放")
-            out, hit = build_transcode(fp, lib_id=lib["id"], rel=rel)
+            try:
+                out, hit = build_transcode(fp, lib_id=lib["id"], rel=rel)
+            except cache_policy.CacheSpaceError as e:
+                return self.send_err(507, str(e))
             if not out:
                 return self.send_err(500, "转码失败")
             fp = out
@@ -5679,6 +5906,7 @@ def _bootstrap_async(rc, pt):
         print(f"[回收站] {ts['items']:,} 项 / {ts['bytes'] / 1048576:.1f} MB ｜ "
               f"到期 {ts['expired']} ｜ {'✅ 与图库互不包含' if ok else '⛔ ' + why}")
 
+    threading.Thread(target=cache_maintenance_loop, name="cache-maintenance", daemon=True).start()
     if rc > 0:
         threading.Thread(target=recheck_loop, name="recheck", daemon=True).start()
     if TRASH and pt > 0:
@@ -5845,7 +6073,9 @@ def main():
         if INDEX:
             INDEX.close()
         if CACHE_INDEX:
-            CACHE_INDEX.close()
+            with cache_governor().maintenance:
+                cache_governor().flush()
+                CACHE_INDEX.close()
         if TRASH:
             TRASH.close()
         if SHARES:

@@ -22,7 +22,7 @@
   <div class="splash-logo">
     <svg viewBox="0 0 48 48" width="56" height="56" aria-hidden="true">
       <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="#7c6bff"/><stop offset="1" stop-color="#ec5f96"/>
+        <stop offset="0" stop-color="#d94520"/><stop offset="1" stop-color="#e69d35"/>
       </linearGradient></defs>
       <rect x="4" y="6" width="40" height="36" rx="11" fill="url(#g1)"/>
       <circle cx="24" cy="24" r="9.5" fill="none" stroke="#fff" stroke-width="2.4" opacity=".95"/>
@@ -44,7 +44,7 @@
       <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
     <div class="brand">
-      <span class="brand-dot"></span>
+      <span class="brand-dot" aria-hidden="true"></span>
       <span id="brandName">时光轴</span>
     </div>
     <div class="tb-right">
@@ -54,19 +54,22 @@
       <button class="icon-btn" id="btnSelect" aria-label="选择照片">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.4 12.3l2.5 2.5 4.7-5.3"/></svg>
       </button>
+      <details class="utility-menu" id="utilityMenu">
+        <summary aria-label="更多功能"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></summary>
+        <div class="utility-popover"><div class="utility-title">相册工具</div>
       <button class="icon-btn" id="btnTrash" aria-label="最近删除">
         <svg viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.9 12.3h8.6L17.2 7M10.2 10.6v5.6M13.8 10.6v5.6"/></svg>
-      </button>
+      <span class="utility-label">最近删除</span></button>
       <button class="icon-btn" id="btnIdx" aria-label="索引进度">
         <svg viewBox="0 0 24 24"><path d="M12 3.6v6.2M12 20.4v-6.2M3.6 12h6.2M20.4 12h-6.2"/><circle cx="12" cy="12" r="3.1"/></svg>
         <span class="idx-dot" id="idxDot" hidden></span>
-      </button>
+      <span class="utility-label">索引进度</span></button>
       <button class="icon-btn" id="btnDensity" aria-label="调整大小">
         <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg>
-      </button>
+      <span class="utility-label">照片大小</span></button>
       <button class="icon-btn" id="btnInfo" aria-label="信息">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8v.2"/></svg>
-      </button>
+      <span class="utility-label">系统与缓存</span></button></div></details>
     </div>
   </div>
 

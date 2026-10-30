@@ -8,6 +8,17 @@
     "autoRescan": true
   },
 
+  "cache": {
+    "_说明": "容量以 GiB（1024³字节）计算。maxGB=0 不自动淘汰有效缓存；设置正数后后台自动管理。shares 是可借用的分类预算，合计必须为1。更改后重启生效。",
+    "maxGB": 0,
+    "minFreeGB": 2,
+    "lowWatermark": 0.8,
+    "checkIntervalSeconds": 60,
+    "graceSeconds": 300,
+    "temporaryGraceSeconds": 3600,
+    "shares": { "thumb": 0.2, "photo": 0.3, "trans": 0.5 }
+  },
+
   "trash": {
     "retentionDays": 30,
     "purgeIntervalSeconds": 1800,

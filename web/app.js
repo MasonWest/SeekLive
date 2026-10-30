@@ -94,7 +94,7 @@ function saveDensity(i) {
 }
 
 const state = {
-  libs: [], lib: null, tree: null,
+  libs: [], lib: null, tree: null, viewEpoch: 0,
   days: [], renderedDayIdx: 0, done: false,
   density: loadDensity(), cols: 3, yearCounts: {},
   search: { active: false, q: '', off: 0, total: 0, done: false },
@@ -356,6 +356,7 @@ function buildChips(libs) {
 
 async function selectLib(id, isBoot = false, anchor = null, pre = null) {
   if (state.lib === id && !isBoot) return;
+  const epoch = ++state.viewEpoch;
   state.lib = id;
   state.switching = true;                  // 阻止哨兵在切库期间用旧索引渲染
   $$('.chip').forEach(c => c.classList.toggle('on', c.dataset.lib === id));
@@ -366,6 +367,7 @@ async function selectLib(id, isBoot = false, anchor = null, pre = null) {
 
   state.renderedDayIdx = 0; state.done = false;
   state.items.clear();
+  state.search.request = null;
   state.search.active = false;
   $('#searchBar').hidden = true;
   thumbReset();                               // 时间轴整体重建：放掉旧的缩略图队列/观察
@@ -382,9 +384,12 @@ async function selectLib(id, isBoot = false, anchor = null, pre = null) {
     if (pre && pre.tree && pre.tree.lib && pre.tree.lib.id === id) {
       state.tree = pre.tree;
     } else {
-      state.tree = await api('/api/tree', { lib: id });
+      const tree = await api('/api/tree', { lib: id });
+      if (epoch !== state.viewEpoch) return;
+      state.tree = tree;
     }
   } catch (e) {
+    if (epoch !== state.viewEpoch) return;
     state.switching = false;
     if ((e.status === 401 || e.status === 403) && IS_SHARE()) {
       shareExpired();                      // 分享已撤销/过期 → 明确告知，而不是「加载失败」
@@ -413,7 +418,9 @@ async function selectLib(id, isBoot = false, anchor = null, pre = null) {
   // 首日照片也已随 bootstrap 拿到 → 先塞进缓存，loadDay 便不必再发一次请求。
   // （键必须与 loadDay 用的 day.key 完全一致，否则等于没塞。）
   if (pre && pre.items && pre.items.items && !state.items.has(state.days[0].key)) {
-    state.items.set(state.days[0].key, pre.items.items);
+    // A partial bootstrap page must not be mistaken for a complete day.
+    if (pre.items.items.length >= pre.items.total)
+      state.items.set(state.days[0].key, pre.items.items);
   }
   $('#denCtl').hidden = false;                // 时间轴出来了，密度控制器才露面
   syncDen();
@@ -578,17 +585,32 @@ function dayCount(day) {
 }
 
 async function loadDay(el) {
-  const { ym, d, key } = { ym: el.dataset.ym, d: el.dataset.d, key: el.dataset.key };
+  const { ym, d, key } = el.dataset;
+  const lib = state.lib, epoch = state.viewEpoch;
+  const current = () => lib === state.lib && epoch === state.viewEpoch;
   const grid = el.querySelector('.grid');
   let items = state.items.get(key);
   if (!items) {
     try {
-      const r = await api('/api/items', { lib: state.lib, ym, d, lim: 600 });
-      items = r.items || [];
+      items = [];
+      let total = Infinity;
+      while (items.length < total) {
+        const r = await api('/api/items', { lib, ym, d, off: items.length, lim: 600 });
+        if (!current()) return;
+        const page = r.items || [];
+        total = r.total;
+        items.push(...page);
+        if (!page.length) break;
+      }
       state.items.set(key, items);
-    } catch (e) { grid.innerHTML = '<div class="e-s" style="grid-column:1/-1">加载失败</div>'; return; }
+    } catch (e) {
+      if (!current()) return;
+      grid.innerHTML = '<button class="day-retry">加载失败，点击重试</button>';
+      grid.querySelector('button').onclick = () => loadDay(el);
+      return;
+    }
   }
-  paintGrid(grid, items, key);
+  if (current()) paintGrid(grid, items, key);
 }
 
 /* =====================================================
@@ -638,7 +660,26 @@ function noteThumbRtt(ms) {
   if (want !== THUMB_MAX) { THUMB_MAX = want; thumbPump(); }
 }
 
-const THUMB_AHEAD = 600;              // 视口外多远开始预取（px）
+const THUMB_AHEAD = 200;              // 视口外多远开始预取（px）
+const thumbViewId = (crypto.randomUUID ? crypto.randomUUID() :
+  Date.now().toString(36) + Math.random().toString(36).slice(2) + 'seeklive');
+let thumbEpoch = 0;
+function thumbAdvance() {
+  thumbEpoch++;
+  // Every surviving visible request must carry the new epoch as well.
+  [...thumbLive].forEach(img => {
+    thumbDefer(img);
+    if (img.isConnected && thumbDistance(img) <= THUMB_AHEAD) {
+      thumbWaiting.add(img); thumbQueue.push(img);
+    }
+  });
+  // The small notice invalidates old server-side waiters even before new day metadata arrives.
+  api('/api/thumb/view', { _slview: thumbViewId, _slepoch: thumbEpoch }).catch(() => {});
+}
+function thumbRequestURL(url) {
+  return url + (url.includes('?') ? '&' : '?') +
+    '_slview=' + encodeURIComponent(thumbViewId) + '&_slepoch=' + thumbEpoch;
+}
 const thumbQueue = [];                // 待发元素
 const thumbWaiting = new Set();       // 已入队（防重复）
 const thumbLive = new Set();          // 在传
@@ -648,16 +689,45 @@ let thumbHeld = false;                // 灯箱打开时挂起
 window.__slThumbNet = () => {
   const s = thumbRtt.slice().sort((a, b) => a - b);
   return { max: THUMB_MAX, fixed: THUMB_MAX_FIXED, samples: s.length,
+           waiting: thumbQueue.length, active: thumbLive.size,
            median: s.length ? Math.round(s[s.length >> 1]) : null };
 };
 
 const thumbObserver = new IntersectionObserver(entries => {
+  if (entries.some(e => !e.isIntersecting && thumbLive.has(e.target) && thumbDistance(e.target) > THUMB_AHEAD)) thumbAdvance();
   entries.forEach(e => {
-    if (!e.isIntersecting) return;
-    thumbObserver.unobserve(e.target);
+    if (!e.isIntersecting) { if (thumbDistance(e.target) > THUMB_AHEAD) thumbDefer(e.target); return; }
     thumbProbe(e.target);
   });
 }, { rootMargin: `${THUMB_AHEAD}px 0px` });
+
+function thumbDistance(img) {
+  const r = img.getBoundingClientRect();
+  return Math.max(0, -r.bottom, r.top - window.innerHeight);
+}
+function thumbDefer(img) {
+  thumbWaiting.delete(img);
+  const i = thumbQueue.indexOf(img);
+  if (i >= 0) thumbQueue.splice(i, 1);
+  if (thumbLive.delete(img)) {
+    img.onload = img.onerror = null;
+    img.removeAttribute('src');
+  }
+}
+function thumbReprioritize() {
+  if ([...thumbLive].some(img => !img.isConnected || thumbDistance(img) > THUMB_AHEAD))
+    thumbAdvance();
+  [...thumbQueue, ...thumbLive].forEach(img => {
+    if (!img.isConnected || thumbDistance(img) > THUMB_AHEAD) thumbDefer(img);
+  });
+  thumbPump();
+}
+let thumbScrollFrame = 0;
+window.addEventListener('scroll', () => {
+  if (!thumbScrollFrame) thumbScrollFrame = requestAnimationFrame(() => {
+    thumbScrollFrame = 0; thumbReprioritize();
+  });
+}, { passive: true });
 
 function thumbProbe(img) {
   if (!img || !img.isConnected || !img.dataset.thumbUrl) return;
@@ -668,10 +738,11 @@ function thumbProbe(img) {
 }
 function thumbPump() {
   if (thumbHeld) return;
+  thumbQueue.sort((a, b) => thumbDistance(a) - thumbDistance(b));
   while (thumbLive.size < THUMB_MAX && thumbQueue.length) {
     const img = thumbQueue.shift();
     thumbWaiting.delete(img);
-    if (!img.isConnected || !img.dataset.thumbUrl) continue;
+    if (!img.isConnected || !img.dataset.thumbUrl || thumbDistance(img) > THUMB_AHEAD) continue;
     thumbStart(img);
   }
 }
@@ -683,6 +754,7 @@ function thumbStart(img) {
     img.onload = img.onerror = null;
     thumbLive.delete(img);
     noteThumbRtt(performance.now() - t0);      // 只用**成功**请求估链路延迟
+    thumbObserver.unobserve(img);
     if (tile) tile.classList.add('loaded');
     fitTile(img);
     thumbPump();
@@ -693,7 +765,7 @@ function thumbStart(img) {
     fallbackThumb(img, tile, tile && tile.item, THUMB_SIZE);
     thumbPump();
   };
-  img.src = img.dataset.thumbUrl;
+  img.src = thumbRequestURL(img.dataset.thumbUrl);
 }
 /* 挂起 / 恢复。挂起时把在途的**撤回**（取消请求、腾出连接），URL 留在
    data-thumb-url 上，灯箱关掉后自动重排 —— 正在看的那张大图因此独占连接池。 */
@@ -712,10 +784,11 @@ function thumbHold(on) {
 }
 /* 时间轴整体重建前调用：清掉队列并断开观察，避免旧节点被观察器一直持有 */
 function thumbReset() {
+  thumbAdvance();
   thumbObserver.disconnect();
   thumbQueue.length = 0;
   thumbWaiting.clear();
-  thumbLive.forEach(img => { img.onload = img.onerror = null; });
+  thumbLive.forEach(img => { img.onload = img.onerror = null; img.removeAttribute('src'); });
   thumbLive.clear();
 }
 
@@ -830,6 +903,7 @@ $('#searchInput').addEventListener('input', e => {
 
 async function runSearch(q) {
   if (!q) { exitSearch(); return; }
+  state.search.request = null;
   state.search.active = true;
   rail.hidden = true; syncRailHeight();
   state.search.q = q; state.search.off = 0; state.search.done = false;
@@ -843,10 +917,16 @@ async function runSearch(q) {
 
 async function loadSearchPage() {
   const grid = $('#searchGrid');
-  if (!grid || state.search.done) return;
+  if (!grid || state.search.done || state.search.request) return;
+  const request = {};
+  state.search.request = request;
+  const lib = state.lib, q = state.search.q, epoch = state.viewEpoch;
+  const current = () => state.search.request === request && state.lib === lib &&
+    state.search.q === q && state.viewEpoch === epoch && $('#searchGrid') === grid;
   try {
-    const r = await api('/api/search', { lib: state.lib, q: state.search.q,
+    const r = await api('/api/search', { lib, q,
       off: state.search.off, lim: 120 });
+    if (!current()) return;
     state.search.total = r.total;
     state.search.off += r.items.length;
     if (r.items.length < 120) state.search.done = true;
@@ -859,7 +939,8 @@ async function loadSearchPage() {
       grid.outerHTML = '<div class="empty"><div class="e-t">没有找到匹配的图片</div>' +
         '<div class="e-s">换个关键词试试</div></div>';
     }
-  } catch (e) { toast('搜索失败：' + e.message, 2600); }
+  } catch (e) { if (current()) toast('搜索失败：' + e.message, 2600); }
+  finally { if (state.search.request === request) state.search.request = null; }
 }
 
 function paintSearch(grid, items, baseIdx) {
@@ -881,6 +962,7 @@ function paintSearch(grid, items, baseIdx) {
 }
 
 function exitSearch() {
+  state.search.request = null;
   state.search.active = false;
   $('#searchBar').hidden = true;
   $('#searchInput').value = '';
@@ -1405,6 +1487,10 @@ function jumpToMonth(ym) {
   if (state.search.active) exitSearch();
   let idx = state.days.findIndex(d => d.ym === ym);
   if (idx < 0) return;
+  thumbAdvance();
+  // Navigation supersedes pending work from the old viewport.
+  [...thumbQueue, ...thumbLive].forEach(img => { thumbDefer(img); thumbObserver.observe(img); });
+  requestAnimationFrame(thumbReprioritize);
   // 确保已渲染到该月
   while (state.renderedDayIdx <= idx && !state.done) renderNextBatch();
   focusRail(ym);
@@ -1728,6 +1814,14 @@ $('#btnInfo').onclick = async () => {
       ['后台核对', (ix.scan && ix.scan.recheckSeconds) ? `每 ${ix.scan.recheckSeconds} 秒` : '关闭'],
       ['缓存总量', `${ca.total.files.toLocaleString()} 个 / ${MB(ca.total.bytes)} MB ` +
         `（图片 ${MB(ca.image.bytes)} + 转码 ${MB(ca.trans.bytes)} MB）`],
+      ['缓存容量管理', ca.policy && ca.policy.maxGB > 0
+        ? `上限 ${ca.policy.maxGB} GiB，超限后清至 ${Math.round(ca.policy.lowWatermark * 100)}%`
+        : '未设置上限，不自动淘汰有效缓存'],
+      ['磁盘空间保护', ca.policy ? `至少保留 ${ca.policy.minFreeGB} GiB` : '—'],
+      ['最近自动回收', ca.governance && ca.governance.at
+        ? `${ca.governance.deleted || 0} 个 / ${MB(ca.governance.bytes || 0)} MB` +
+          (ca.governance.blocked ? '（清理受限：部分缓存正在使用或受保护）' : '')
+        : '尚未执行'],
       ['缓存清单', `${(ca.manifest.entries || 0).toLocaleString()} 条记录 / db ${ca.manifest.dbMB || 0} MB`],
       ['孤儿缓存', ca.orphan
         ? `${ca.orphan.files.toLocaleString()} 个 / ${MB(ca.orphan.bytes)} MB 可回收`
@@ -2792,3 +2886,19 @@ if (window.ResizeObserver) {
 
 /* 启动 */
 boot();
+
+/* Native disclosure keeps maintenance tools out of the photo surface. */
+const utilityMenu = $('#utilityMenu');
+if (utilityMenu) {
+  utilityMenu.addEventListener('click', e => {
+    if (e.target.closest('button')) utilityMenu.open = false;
+  });
+  document.addEventListener('click', e => {
+    if (!utilityMenu.contains(e.target)) utilityMenu.open = false;
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && utilityMenu.open) {
+      utilityMenu.open = false; utilityMenu.querySelector('summary').focus();
+    }
+  });
+}

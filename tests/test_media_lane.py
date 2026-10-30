@@ -191,7 +191,7 @@ def main():
     chk("/thumb 判定后设 fg = False", "fg = False" in ssrc)
     chk("/photo 判定后设 fg = True", "fg = True" in ssrc)
     chk("fg 传进了 cached_image", "fg=fg" in ssrc)
-    csrc = inspect.getsource(S.cached_image)
+    csrc = inspect.getsource(S.cached_image) + inspect.getsource(S._cached_image)
     chk("cached_image 用 gen_gate(foreground=fg)", "gen_gate(foreground=fg)" in csrc)
 
     # ---------------- 8) 缓存命中不占闸（既有行为） ----------------
