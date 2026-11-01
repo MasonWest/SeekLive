@@ -59,9 +59,13 @@ class VisionService:
                         try:self.request_index();store.finish(request['id'],self.runtime+'-index')
                         except Exception:store.finish(request['id'],self.runtime+'-index',error='IndexSyncFailed')
                         foreground=bool(self.busy())
-                if (now-last_sync>=60 or state['last_sync']==0) and not foreground:
-                    try:synchronize(store,self.index,versions['full'],review_delay=60);last_sync=now
+                rematch=None if foreground else store.claim(self.runtime+'-rematch',kind='vision-rematch')
+                if (now-last_sync>=60 or state['last_sync']==0) and not foreground or rematch:
+                    try:
+                        synchronize(store,self.index,versions['full'],review_delay=0,refresh_completed=bool(rematch));last_sync=now
+                        if rematch:store.finish(rematch['id'],self.runtime+'-rematch')
                     except Exception:
+                        if rematch:store.release(rematch['id'],self.runtime+'-rematch')
                         with store.db:store.db.execute("UPDATE vision_control SET last_error='IndexSyncFailed' WHERE id=1")
                         last_sync=now
                 if self.process is None or self.process.poll() is not None:
@@ -91,7 +95,7 @@ class VisionService:
         store=VisionDB(self.database)
         try:
             control(store,action)
-            if action in ('resume','retry','scan') and (self.thread is None or not self.thread.is_alive()):self.start()
+            if action in ('resume','retry','scan','rematch') and (self.thread is None or not self.thread.is_alive()):self.start()
             return status(store)
         finally:store.close()
 

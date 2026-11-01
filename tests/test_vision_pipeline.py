@@ -59,6 +59,21 @@ class VisionPipelineTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT kind FROM observations WHERE id='NEW'").fetchone()[0],'cat')
         self.assertEqual(self.store.load('d'),before)
         self.assertEqual(repair_unreviewed_species(self.store),0)
+    def test_automatic_sync_does_not_repeat_completed_scans_after_confirmation(self):
+        job=self.job();publish(self.store,job,'owner','runtime',self.observations(job),[])
+        import array
+        with self.store.db:self.store.db.execute("UPDATE features SET vector=? WHERE observation='F'",(array.array('f',[0.,1.]).tobytes(),))
+        self.assertEqual(synchronize(self.store,self.index,'model',refresh_completed=False)['queued'],0)
+        self.assertEqual(synchronize(self.store,self.index,'model',refresh_completed=True)['queued'],1)
+        synchronize(self.store,self.index,'model',refresh_completed=False)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM jobs WHERE status='pending'").fetchone()[0],1)
+    def test_old_automatic_rematch_queue_is_retired_without_deleting_results(self):
+        job=self.job();publish(self.store,job,'owner','runtime',self.observations(job),[])
+        payload=job['payload'];payload.pop('refresh_existing',None)
+        self.store.enqueue('legacy-refresh','vision',payload)
+        synchronize(self.store,self.index,'model',refresh_completed=False)
+        self.assertEqual(self.store.db.execute("SELECT status FROM jobs WHERE key='legacy-refresh'").fetchone()[0],'done')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM vision_scans').fetchone()[0],1)
     def test_incremental_dedupe_and_file_model_invalidation(self):
         self.assertEqual(synchronize(self.store,self.index,'model')['queued'],1)
         self.assertEqual(synchronize(self.store,self.index,'model')['queued'],0)

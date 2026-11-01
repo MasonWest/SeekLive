@@ -17,7 +17,7 @@ if(liveDatabase)$('#saveState').textContent='本机 SQLite 已连接 · 版本 '
 globalThis.addEventListener?.('beforeunload',event=>{if(liveDatabase&&(databaseSaving||databasePending)){event.preventDefault();event.returnValue='修改仍在保存，请稍候'}});
 if(liveDatabase?.vision&&typeof document.querySelector('header')?.appendChild==='function'){
  const panel=document.createElement('div');panel.className='note';panel.style.marginTop='14px';
- panel.innerHTML='<span id="visionStatus">正在读取后台识别进度…</span><div class="actions"><button data-vision-action="pause">暂停识别</button><button data-vision-action="resume">继续识别</button><button data-vision-action="scan">核对新增照片</button><button data-vision-action="retry">重试失败项</button></div>';
+ panel.innerHTML='<span id="visionStatus">正在读取后台识别进度…</span><div class="actions"><button data-vision-action="pause">暂停识别</button><button data-vision-action="resume">继续识别</button><button data-vision-action="scan">核对新增照片</button><button data-vision-action="rematch">用当前参考重新匹配全库</button><button data-vision-action="retry">重试失败项</button></div>';
  document.querySelector('header').appendChild(panel);
  let polling=false;
  async function updateVision(action){

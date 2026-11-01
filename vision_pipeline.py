@@ -137,7 +137,7 @@ def repair_unreviewed_species(store):
     return changed
 
 
-def synchronize(store,index_path,model,review_delay=0):
+def synchronize(store,index_path,model,review_delay=0,refresh_completed=True):
     repair_unreviewed_species(store)
     dataset=active_dataset(store);sources=index_sources(index_path);queued=0
     with store.db:
@@ -161,6 +161,7 @@ def synchronize(store,index_path,model,review_delay=0):
         for row in store.db.execute("SELECT id,payload FROM jobs WHERE kind='vision' AND status='pending'"):
             payload=json.loads(row['payload']);sid=payload['source']['id']
             if payload['dataset']!=dataset:continue
+            if not refresh_completed and not payload.get('refresh_existing') and complete.get(sid,())[:2]==(current_versions.get(sid),model):redundant.append((row['id'],));continue
             if payload['model']!=model or payload['version']!=current_versions.get(sid):redundant.append((row['id'],));continue
             if complete.get(sid)==(current_versions.get(sid),model,reference):redundant.append((row['id'],));continue
             if payload['version']==current_versions.get(sid) and payload['model']==model:
@@ -171,9 +172,10 @@ def synchronize(store,index_path,model,review_delay=0):
         for source in sources:
             stamp=version(source);done=store.db.execute('SELECT version,model,reference FROM vision_scans WHERE media=?',(source['id'],)).fetchone()
             if done and tuple(done)==(stamp,model,reference):continue
+            if not refresh_completed and done and tuple(done)[:2]==(stamp,model):continue
             if settling and done and tuple(done)[:2]==(stamp,model):continue # Coalesce consecutive review batches before rematching completed photos.
             key='vision:'+digest([source['id'],stamp,model,reference,dataset])
-            payload=dict(source=source,version=stamp,model=model,reference=reference,dataset=dataset)
+            payload=dict(source=source,version=stamp,model=model,reference=reference,dataset=dataset,refresh_existing=refresh_completed)
             changed=0 if source['id'] in pending else store.db.execute("""INSERT INTO jobs(key,kind,payload,status,priority) VALUES(?,'vision',?,'pending',0)
               ON CONFLICT(key) DO UPDATE SET status='pending',payload=excluded.payload,error=NULL
               WHERE jobs.status='done' OR (jobs.status='failed' AND jobs.error='SourceUnavailable')""",(key,json.dumps(payload))).rowcount
@@ -187,6 +189,9 @@ def control(store,action):
     with store.db:
         if action in ('pause','resume'):store.db.execute('UPDATE vision_control SET paused=? WHERE id=1',(int(action=='pause'),))
         elif action=='retry':store.db.execute("UPDATE jobs SET status='pending',error=NULL,owner=NULL,lease_until=NULL WHERE kind='vision' AND status='failed'")
+        elif action=='rematch':
+            store.db.execute("INSERT INTO jobs(key,kind,payload,status,priority) VALUES('vision-explicit-rematch','vision-rematch','{}','pending',10) ON CONFLICT(key) DO UPDATE SET status='pending',error=NULL WHERE jobs.status IN ('done','failed')")
+            store.db.execute('UPDATE vision_control SET paused=0,last_sync=0 WHERE id=1')
         elif action!='scan':raise ValueError('Unknown vision action')
         if action=='scan':
             store.db.execute("""INSERT INTO jobs(key,kind,payload,status,priority) VALUES('vision-index-refresh','vision-index','{}','pending',10)
