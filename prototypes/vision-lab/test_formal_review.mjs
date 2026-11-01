@@ -16,7 +16,7 @@ const context=vm.createContext({URLSearchParams,Set,console,
  fetch:async(path,options)=>{
   calls.push({path,options});let data;
   if(path==='/api/vision/summary')data=summary();
-  else if(path.startsWith('/api/vision/photos'))data={name:'Example',total:1,items:[{id:'N',captured:'2025',score:archived?null:.9}]};
+  else if(path.startsWith('/api/vision/photos'))data={kind:'person',name:'Example',total:1,items:[{id:'N',captured:'2025',score:archived?null:.9}]};
   else {assert.equal(path,'/api/vision/decision');assert.equal(JSON.parse(options.body).revision,1);archived=true;data={revision:2,state:{from:'SQLite'},changed:1}}
   return {ok:true,json:async()=>data};
  }

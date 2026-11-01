@@ -23,6 +23,19 @@ class GalleryTests(unittest.TestCase):
                 self.store.db.execute('INSERT INTO observations VALUES(?,?,?,?,?)',('d',oid,'m',kind,json.dumps(metadata)))
                 self.store.db.execute('INSERT INTO vision_suggestions VALUES(?,?,?,?,?,?,?,?)',('d',oid,entity,'m',self.stamp,'refs',.9,'pending'))
     def tearDown(self):self.store.close();self.temp.cleanup()
+    def test_remove_archived_pet_preserves_source_and_can_be_undone(self):
+        result=decide(self.store,'d','PET',['C'],'remove',1)
+        self.assertTrue(self.photo.is_file())
+        self.assertEqual(photos(self.store,'d','PET','confirmed')['total'],0)
+        self.assertEqual(self.store.db.execute("SELECT status FROM vision_suggestions WHERE observation='C'").fetchone()[0],'rejected')
+        self.assertEqual(photos(self.store,'d','P','confirmed')['total'],1)
+        decide(self.store,'d','PET',[],'undo',result['revision'])
+        self.assertEqual(photos(self.store,'d','PET','confirmed')['total'],1)
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM vision_suggestions WHERE observation='C'").fetchone())
+    def test_remove_requires_current_archived_assignment(self):
+        before=self.store.load('d')
+        with self.assertRaises(Conflict):decide(self.store,'d','PET',['NC'],'remove',1)
+        self.assertEqual(self.store.load('d'),before)
     def test_live_counts_and_pages_are_not_prototype_counts(self):
         result=summary(self.store,'d');self.assertEqual(result['pending'],3)
         self.assertEqual(photos(self.store,'d','P',limit=1)['total'],2)

@@ -77,7 +77,7 @@ def photos(store,dataset,entity,mode='pending',offset=0,limit=24):
 
 
 def decide(store,dataset,entity,ids,action,expected_revision):
-    if action not in ('confirm','reject','undo'):raise ValueError('Unknown review action')
+    if action not in ('confirm','reject','undo','remove'):raise ValueError('Unknown review action')
     if not isinstance(ids,list) or len(ids)>120 or any(not isinstance(i,str) for i in ids):raise ValueError('Invalid selection')
     ids=list(dict.fromkeys(ids))
     with store.db:
@@ -86,6 +86,20 @@ def decide(store,dataset,entity,ids,action,expected_revision):
         record=store.db.execute('SELECT * FROM entities WHERE dataset=? AND id=?',(dataset,entity)).fetchone()
         if not record or record['status']!='followed':raise ValueError('Identity is not followed')
         state=copy.deepcopy(loaded['state']);catalog=json.loads(store.db.execute('SELECT catalog FROM datasets WHERE id=?',(dataset,)).fetchone()[0]);history=state.setdefault('formal_history',[])
+        if action=='remove':
+            if record['kind']=='person':raise ValueError('This action is for animal archives')
+            if not ids:raise ValueError('Select photos first')
+            for oid in ids:
+                member=store.db.execute("SELECT entity,confirmation FROM memberships WHERE dataset=? AND observation=?",(dataset,oid)).fetchone()
+                if not member or tuple(member)!=(entity,'confirmed'):raise Conflict('Archived assignment changed; refresh first')
+            previous={oid:(lambda r:r[0] if r else None)(store.db.execute('SELECT status FROM vision_suggestions WHERE dataset=? AND observation=? AND entity=?',(dataset,oid,entity)).fetchone()) for oid in ids}
+            state['animal_entities'][entity]['members']=[oid for oid in state['animal_entities'][entity]['members'] if oid not in ids]
+            history.append(dict(entity=entity,ids=ids,action='remove',at=time.time(),suggestion_status=previous));state['formal_history']=history[-30:]
+            revision=store.save(dataset,state,expected_revision,source='formal_remove',catalog=catalog,_locked=True)
+            for oid in ids:
+                row=store.db.execute('SELECT o.sample,v.size,v.mtime_ns FROM observations o LEFT JOIN vision_media v ON v.id=o.sample WHERE o.dataset=? AND o.id=?',(dataset,oid)).fetchone()
+                store.db.execute("INSERT INTO vision_suggestions VALUES(?,?,?,?,?,?,?,'rejected') ON CONFLICT(dataset,observation,entity) DO UPDATE SET status='rejected'",(dataset,oid,entity,row['sample'],version(row) if row['size'] is not None else '', '',0.))
+            return dict(revision=revision,state=state,changed=len(ids),entity=entity)
         if action=='undo':
             index=next((i for i in range(len(history)-1,-1,-1) if history[i]['entity']==entity),None)
             if index is None:raise ValueError('No formal review action to undo')
@@ -101,8 +115,14 @@ def decide(store,dataset,entity,ids,action,expected_revision):
                     catalog['confirmed']=[f for f in catalog.get('confirmed',[]) if f['id'] not in ids]
                     catalog['confirmed'].extend(receipt['previous_confirmed'])
                 else:state['animal_entities'][entity]['members']=[oid for oid in state['animal_entities'][entity]['members'] if oid not in ids]
+            if receipt['action']=='remove':
+                for oid in ids:
+                    if store.db.execute("SELECT 1 FROM memberships WHERE dataset=? AND observation=? AND confirmation='confirmed'",(dataset,oid)).fetchone():raise Conflict('Assignment changed; cannot undo removal')
+                animal=state['animal_entities'][entity];animal['members']=list(dict.fromkeys(animal['members']+ids))
             revision=store.save(dataset,state,expected_revision,source='formal_undo',catalog=catalog,_locked=True)
-            for oid,previous in receipt['suggestion_status'].items():store.db.execute('UPDATE vision_suggestions SET status=? WHERE dataset=? AND observation=? AND entity=?',(previous,dataset,oid,entity))
+            for oid,previous in receipt['suggestion_status'].items():
+                if previous is None:store.db.execute('DELETE FROM vision_suggestions WHERE dataset=? AND observation=? AND entity=?',(dataset,oid,entity))
+                else:store.db.execute('UPDATE vision_suggestions SET status=? WHERE dataset=? AND observation=? AND entity=?',(previous,dataset,oid,entity))
         else:
             if not ids:raise ValueError('Select photos first')
             rows=[]

@@ -13,7 +13,7 @@ animalNormalize();
 function animalKind(id){return labels.animal_checks[id]||byId.get(id)?.kind}
 function animalOwner(id){return Object.values(labels.animal_entities).find(e=>e.members.includes(id))}
 function animalCheckpoint(){labels.animal_history.push(JSON.parse(JSON.stringify({animal_entities:labels.animal_entities,animal_checks:labels.animal_checks,animal_splits:labels.animal_splits})));if(labels.animal_history.length>30)labels.animal_history.shift()}
-function animalUndo(){const prev=labels.animal_history.pop();if(prev){Object.assign(labels,prev);labels.animal_splits=prev.animal_splits||[]}animalSelected.clear();save();render()}
+function animalUndo(){if(liveDatabase?.formal){alert('已归档照片请在已归档列表中勾选移除，不需要撤销整份档案。');return}const prev=labels.animal_history.pop();if(prev){Object.assign(labels,prev);labels.animal_splits=prev.animal_splits||[]}animalSelected.clear();save();render()}
 function animalScore(entity,id){
  if(entity?.kind==='bird'||!D.animal_similarity?.small)return null;
  const ids=D.animal_similarity.ids,j=ids.indexOf(id);if(j<0)return null;
@@ -42,7 +42,7 @@ function animalGroupCard(group,mode){
 }
 function animalToolbar(groups){
  const entities=Object.values(labels.animal_entities),invalid=D.pets.filter(p=>!animalOwner(p.id)&&!animalWords[animalKind(p.id)]);
- return `<p>先看候选小组，给一组命名，再勾选其他组批量合并。猫狗按已有特征预分组，鸟和无特征的照片先独立成组。候选分组不代表已确认同一只。</p><div class="actions">${[['followed','关注的动物'],['other','候选分组'],['unfollowed','不关注'],['excluded','待定／框错']].map(([v,t])=>`<button data-animal-view="${v}" class="${animalView===v?'primary':''}">${t} · ${v==='other'?groups.length:v==='excluded'?invalid.length:entities.filter(e=>e.status===v).length}</button>`).join('')}<select id="animalSpecies" aria-label="动物类别">${choices([['all','全部物种'],['cat','猫'],['dog','狗'],['bird','鸟']],animalSpecies)}</select><button data-animal-action="undo" ${labels.animal_history.length?'':'disabled'}>撤销动物操作</button></div>`;
+ return `<p>先看候选小组，给一组命名，再勾选其他组批量合并。猫狗按已有特征预分组，鸟和无特征的照片先独立成组。候选分组不代表已确认同一只。</p><div class="actions">${[['followed','关注的动物'],['other','候选分组'],['unfollowed','不关注'],['excluded','待定／框错']].map(([v,t])=>`<button data-animal-view="${v}" class="${animalView===v?'primary':''}">${t} · ${v==='other'?groups.length:v==='excluded'?invalid.length:entities.filter(e=>e.status===v).length}</button>`).join('')}<select id="animalSpecies" aria-label="动物类别">${choices([['all','全部物种'],['cat','猫'],['dog','狗'],['bird','鸟']],animalSpecies)}</select><button data-animal-action="undo" ${!liveDatabase?.formal&&labels.animal_history.length?'':'disabled'} title="已归档照片请在已归档列表中勾选移除">撤销动物操作</button></div>`;
 }
 function animalBulkBar(mode,targets){
  const selected=targets.filter(g=>animalSelected.has(g.id)),count=selected.reduce((n,g)=>n+g.members.length,0);
