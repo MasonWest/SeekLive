@@ -62,9 +62,10 @@ chk('bootLegacy 仍按 session→libs 顺序取数',
 const sl = js.match(/async function selectLib\(([^)]*)\)/);
 chk('selectLib 接受第 4 个参数 pre', !!sl && /\bpre\b/.test(sl[1]), sl ? sl[1] : '');
 chk('selectLib 优先用 pre.tree', /pre\s*&&\s*pre\.tree[\s\S]{0,120}state\.tree\s*=\s*pre\.tree/.test(js));
-chk('selectLib 把首日 items 塞进缓存（按 state.days[0].key）',
-  /pre\.items[\s\S]{0,160}state\.items\.set\(state\.days\[0\]\.key/.test(js));
-chk('首日 items 的缓存键与 loadDay 一致（都用 day.key）', /state\.items\.get\(key\)/.test(js));
+chk('selectLib 将首日按固定页大小写入缓存',
+  /state.days\[0\][^]*?rememberPage\(context, off, \{ items: page, total \}\)/.test(js));
+chk('缓存键包含图库、视图版本、查询词、日期和页偏移',
+  /JSON.stringify\(\[context.epoch, context.lib, context.q \|\| '', context.key, off\]\)/.test(js));
 
 // 服务端侧不变量
 chk('server.py: /api/bootstrap 在匿名白名单 ANON_GET 中',

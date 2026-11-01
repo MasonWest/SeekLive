@@ -64,9 +64,9 @@
         <svg viewBox="0 0 24 24"><path d="M12 3.6v6.2M12 20.4v-6.2M3.6 12h6.2M20.4 12h-6.2"/><circle cx="12" cy="12" r="3.1"/></svg>
         <span class="idx-dot" id="idxDot" hidden></span>
       <span class="utility-label">索引进度</span></button>
-      <button class="icon-btn" id="btnDensity" aria-label="调整大小">
+      <button class="icon-btn" id="btnDensity" aria-label="浏览方式">
         <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg>
-      <span class="utility-label">照片大小</span></button>
+      <span class="utility-label">浏览方式</span></button>
       <button class="icon-btn" id="btnInfo" aria-label="信息">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8v.2"/></svg>
       <span class="utility-label">系统与缓存</span></button></div></details>
@@ -74,6 +74,12 @@
   </div>
 
   <div class="tb-chips" id="chips"></div>
+  <nav class="collection-nav" id="collectionNav" aria-label="相册浏览" hidden>
+    <button type="button" data-collection="photos" aria-pressed="true">全部照片</button>
+    <button type="button" data-collection="people" aria-pressed="false">人物</button>
+    <button type="button" data-collection="animals" aria-pressed="false">动物</button>
+    <button type="button" data-collection="memories" aria-pressed="false">回忆</button>
+  </nav>
 
   <div class="tb-search" id="searchBar" hidden>
     <svg class="s-ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
@@ -100,6 +106,11 @@
       <svg viewBox="0 0 24 24"><path d="M9.5 5L16 12l-6.5 7"/></svg>
     </button>
     <div class="rail-months" id="railMonths"></div>
+    <div class="wall-levels" role="group" aria-label="时间浏览层级">
+      <button type="button" data-wall-mode="day" aria-label="按日浏览" title="按日浏览">日</button>
+      <button type="button" data-wall-mode="month" aria-label="按月浏览" title="按月浏览">月</button>
+      <button type="button" data-wall-mode="year" aria-label="按年浏览" title="按年浏览">年</button>
+    </div>
   </div>
 </nav>
 
@@ -123,7 +134,7 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12"/></svg>
   </button>
   <button class="den-mid" id="denMid" type="button" aria-haspopup="dialog"
-          aria-label="照片大小">
+          aria-label="浏览方式">
     <span class="den-name" id="denName">标准</span>
     <span class="den-dots" id="denDots" aria-hidden="true"></span>
   </button>
@@ -214,7 +225,8 @@
   <div class="sheet-bg" data-close></div>
   <div class="sheet-card">
     <div class="vd-grab"></div>
-    <div class="vd-head">照片大小</div>
+    <div class="vd-head" id="denSheetTitle">浏览方式</div>
+    <button class="wall-dialog-close" id="denClose" aria-label="关闭浏览方式">×</button>
     <div class="sheet-scroll" id="denList"></div>
   </div>
 </div>
@@ -328,7 +340,24 @@
 </div>
 
 <!-- ── 提示 ──────────────────────────────────────── -->
-<div id="toast" class="toast" hidden></div>
+<div id="memoryPlayer" class="memory-player" role="dialog" aria-modal="true" aria-label="回忆影片" hidden>
+  <div class="memory-stage" id="memoryStage"></div>
+  <div class="memory-player-top"><span id="memoryPlayerName"></span><div class="memory-top-actions"><button type="button" id="memoryAll">全部照片</button><button type="button" id="memoryOptions">开场与播放</button><button type="button" id="memoryClose" aria-label="关闭回忆">✕</button></div></div>
+  <div class="memory-player-bottom"><div id="memoryProgress" class="memory-progress"></div><div class="memory-controls"><button type="button" id="memoryPrev" aria-label="上一张">←</button><button type="button" id="memoryPlay">播放回忆</button><button type="button" id="memoryNext" aria-label="下一张">→</button><button type="button" id="memorySound" aria-pressed="true">♫ 配乐开</button><span id="memoryCounter"></span></div></div>
+  <section id="memorySettingsPanel" class="memory-settings" aria-label="开场与播放设置" hidden>
+    <div class="memory-settings-head"><h2>开场与播放</h2><button type="button" id="memorySettingsClose" aria-label="关闭设置">✕</button></div>
+    <label>回忆标题<input id="memoryEditTitle" maxlength="40"></label>
+    <label>地点／出游名称<input id="memoryEditPlace" maxlength="80"></label>
+    <label>开场风格<select id="memoryEditTheme"><option value="ink">墨色题字</option><option value="amber">暖色胶片</option><option value="sage">清爽明信片</option></select></label>
+    <div class="memory-settings-row"><label>画面比例<select id="memoryEditLayout"><option value="auto">跟随屏幕</option><option value="portrait">竖屏 · 优先竖版照片</option><option value="landscape">宽屏 · 优先横版照片</option></select></label><label>播放内容<select id="memoryEditMode"><option value="selected">精选照片</option><option value="full">这次经历的全部照片</option></select></label></div>
+    <button type="button" id="memoryChooseCover">更换开场封面</button>
+    <div id="memoryCoverPicker" hidden><div id="memoryCoverGrid" class="memory-cover-grid"></div><div class="memory-cover-pages"><button type="button" id="memoryCoverPrev">上一页</button><span id="memoryCoverPage"></span><button type="button" id="memoryCoverNext">下一页</button></div></div>
+    <details class="memory-organize"><summary>整理这次经历</summary><label>把另一段合并进来<select id="memoryMergeTarget"><option value="">选择另一段回忆</option></select></label><button type="button" id="memoryMerge">合并为一段经历</button><label>从这个时间开始拆成下一段<input id="memorySplitTime" type="datetime-local" step="1"></label><button type="button" id="memorySplit">拆成两段经历</button><button type="button" id="memoryUndoOrganize">撤销上次分组整理</button></details>
+    <p id="memorySettingsMessage" role="status"></p>
+    <button type="button" id="memorySave" class="memory-save">保存并应用</button>
+  </section>
+</div>
+<div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
 
 <script src="app.js"></script>
 </body>

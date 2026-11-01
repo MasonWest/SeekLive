@@ -10,8 +10,8 @@
  *   1. 恰好五档，名称与时间分组正确（day/day/day/month/year）
  *   2. 目标宽度严格递减（越靠后越密）；不存在旧的 DENSITY_STEPS 三档
  *   3. computeCols 写 --cols 并切换 grp-day/month/year
- *   4. 分组只靠 CSS class：年份分隔时刻在 DOM 里，可见性由 app.css 决定
- *   5. setDensity 只改样式：不发起任何网络请求、不改图片 URL
+ *   4. 月份连续网格、年份封面概览；原有日视图仍保留
+ *   5. 层级切换按锚点重建；所有缩略图仍保持同一规格
  *   6. 切换前后浏览位置由锚点续接（topVisibleBlock + scrollBy）
  *   7. index.html / app.css 的控制器结构与样式齐全，且选择模式下让位
  *   8. 单档 640 契约不因密度功能回归（THUMB_SIZE / 无 srcset）
@@ -80,14 +80,17 @@ chk('app.css 里 grp-year 才显示年份分隔',
   /html\.grp-year\s+\.year-sep\{[^}]*display:block/.test(css));
 chk('app.css 里 grp-month / grp-year 收起日期头',
   /html\.grp-month\s+\.day-hd,\s*html\.grp-year\s+\.day-hd\{[^}]*display:none/.test(css));
-chk('app.css 里年份档把月份分隔降级为小标签',
-  /html\.grp-year\s+\.month-sep\{/.test(css));
+chk('月份使用每月连续网格，而不是隐藏日期头冒充月视图',
+  /month-wall/.test(body('renderMonthBatch')) && /while \(index < state.days.length && state.days\[index\].ym === ym\)/.test(body('renderMonthBatch')));
+chk('年份使用月份封面卡片，点击展开月份',
+  /month-card/.test(body('renderYearOverview')) && /setDensity\(3\); jumpToMonth\(month.ym\)/.test(body('renderYearOverview')));
 
 /* 4. 切档不触网、不改图片 URL */
 const sd = body('setDensity');
-chk('setDensity 不发起任何请求', sd && !/fetch\(|api\(|thumbURL\(|\/thumb/.test(sd), sd ? '' : '未找到 setDensity');
-chk('setDensity 只改样式：computeCols + sizeSkeletons',
+chk('setDensity 不直接请求图片或改变缩略图规格', sd && !/fetch\(|api\(|thumbURL\(|\/thumb/.test(sd), sd ? '' : '未找到 setDensity');
+chk('同层级切换更新列数和窗口高度',
   /computeCols\(\)/.test(sd) && /sizeSkeletons\(/.test(sd));
+chk('跨层级切换转换锚点并重建照片墙', /rebuildWall\(convertWallAnchor\(/.test(sd));
 chk('setDensity 重算预加载余量（rearmObserver）', /rearmObserver\(\)/.test(sd));
 chk('setDensity 记住选择（localStorage）', /saveDensity\(/.test(sd));
 chk('localStorage 读写都有 try/catch 兜底',

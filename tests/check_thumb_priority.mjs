@@ -29,3 +29,27 @@ assert.deepEqual(context.thumbQueue.map(img=>img.name),['visible']);
 assert.equal(requests[0]._slepoch,1);
 assert(context.thumbRequestURL('/thumb?p=a').endsWith('_slepoch=1'));
 console.log('PASS: viewport epoch announces cancellation and restamps visible retries');
+let pumps=0;
+context.thumbPump=()=>pumps++;
+vm.runInContext('let thumbHeld=false;\n'+fn('thumbHold'),context);
+const pendingImage=image('pending',100);
+context.thumbLive.add(pendingImage);
+const beforeNotices=requests.length;
+context.thumbHold(true);
+assert(pendingImage.cancelled);
+assert.equal(requests.length,beforeNotices+1);
+assert.equal(context.thumbLive.size,0);
+assert.equal(pumps,0);
+context.thumbHold(false);
+assert.equal(pumps,1);
+console.log('PASS: opening viewer also supersedes server waiters; closing resumes thumbnails');
+{
+  const img=image('still-visible',100),observed=new Set([img]);let freshEntries=0;
+  const ctx=vm.createContext({state:{search:{active:false},days:[{ym:'2026-09'}],renderedDayIdx:1,done:false},
+    thumbQueue:[img],thumbLive:new Set(),thumbAdvance(){},thumbDefer(){},
+    thumbObserver:{unobserve(i){observed.delete(i)},observe(i){if(!observed.has(i))freshEntries++;observed.add(i)}},
+    requestAnimationFrame(){},thumbReprioritize(){},focusRail(){},pinMonth(){}});
+  vm.runInContext(fn('jumpToMonth'),ctx);ctx.jumpToMonth('2026-09');
+  assert.equal(freshEntries,1);
+  console.log('PASS: month jumps rearm visible cancelled images even without an intersection change');
+}

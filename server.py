@@ -55,6 +55,7 @@ import sys
 import io
 import re
 import json
+import sqlite3
 import math
 import time
 import bisect
@@ -66,6 +67,7 @@ import ipaddress
 import secrets
 import threading
 import contextlib
+import functools
 import mimetypes
 import subprocess
 import statistics
@@ -232,6 +234,8 @@ PID_FILE = os.path.join(APP_DIR, _STATE_PREFIX + "server.pid")
 PORT_FILE = os.path.join(APP_DIR, _STATE_PREFIX + "server.port")
 
 INDEX = None                       # index_db.Index 实例（启动时打开）
+VISION = None                      # 独立低优先级识别进程，由正式服务负责生命周期
+VISION_AUTOSTART = False            # 只有 main 启动；测试夹具导入模块不触发真实扫描
 INDEX_LOCK = threading.RLock()     # 串行化「扫描 → 交换内存索引」
 CACHE_INDEX = None                 # cache_db.CacheIndex：缓存清单（记录谁生成了哪个缓存）
 TRASH = None                       # trash_db.Trash：回收站账本
@@ -502,6 +506,34 @@ def gen_gate(foreground=False):
     finally:
         with _bg_wait_lock:
             _bg_waiting -= 1
+
+
+def vision_media(method):
+    """Only an in-memory counter on the request path; no model or SQLite work."""
+    @functools.wraps(method)
+    def wrapped(self,*args,**kwargs):
+        if VISION is None:return method(self,*args,**kwargs)
+        with VISION.demand():return method(self,*args,**kwargs)
+    return wrapped
+
+
+def start_vision_runtime():
+    global VISION
+    if not VISION_AUTOSTART or os.environ.get('SEEKLIVE_VISION','1')=='0' or VISION is not None:return
+    try:
+        from vision_service import VisionService
+        python=os.environ.get('SEEKLIVE_VISION_PYTHON')
+        if not python:
+            candidates=[os.path.join(APP_DIR,'.venv-vision','Scripts','python.exe'),
+                        os.path.join(APP_DIR,'tmp','vision-lab','venv','Scripts','python.exe')]
+            python=next((candidate for candidate in candidates if os.path.isfile(candidate)),sys.executable)
+        VISION=VisionService(os.path.join(DATA_DIR,'vision.db'),INDEX_DB,
+                             os.path.join(DATA_DIR,'vision','models'),os.path.join(DATA_DIR,'vision','media'),
+                             python=python,busy=lambda:bool(_fg_active or _bg_waiting or idx_get().get('running')),
+                             request_index=lambda:threading.Thread(target=_bg_index,kwargs={'full':False},name='vision-index-refresh',daemon=True).start())
+        VISION.start()
+    except Exception:
+        log.exception('识别后台未能启动；图库浏览保持可用')
 
 
 def bump(k, n=1):
@@ -4681,6 +4713,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_item(qs)
         if path == "/api/stats":
             return self.api_stats()
+        if path == "/api/vision/status":
+            return self.api_vision_status()
+        if path in ("/api/vision/albums", "/api/vision/album"):
+            return self.api_vision_albums(qs, path.endswith('/album'))
+        if path in ("/api/vision/stories", "/api/vision/story", "/api/vision/story/items"):
+            return self.api_memory_stories(qs,path!='/api/vision/stories',items=path.endswith('/items'))
         if path == "/api/refresh":
             return self.api_refresh(qs)
         if path == "/api/index":
@@ -4743,6 +4781,14 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 索引维护（非破坏性；全量重建才要管理授权）----
         if path == "/api/index/scan":
             return self.api_index_scan()
+        if path == "/api/vision/control":
+            return self.api_vision_control()
+        if path == "/api/vision/growth/cover":
+            return self.api_growth_cover()
+        if path == "/api/vision/story/edit":
+            return self.api_memory_edit()
+        if path == "/api/vision/story/organize":
+            return self.api_memory_organize()
         # ---- 分享管理（管理端；经 admin_guard + CSRF 头）----
         if path == "/api/share/create":
             return self.api_share_create()
@@ -4762,6 +4808,132 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_err(404, "not found")
 
     # ---------- 管理授权接口 ----------
+    def api_memory_stories(self,qs,detail=False,items=False):
+        code,msg=self.admin_guard(need_header=False)
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        lib,cont,err=self._scope_container(qs)
+        if err:return self.send_err(*err)
+        from memory_stories import read_samples
+        from vision_albums import snapshot
+        identity=(qs.get('id') or [''])[0] if detail else None
+        if detail and not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',identity):return self.send_err(400,'回忆编号无效')
+        try:
+            layout=(qs.get('layout') or ['auto'])[0];mode=(qs.get('mode') or ['selected'])[0]
+            if layout not in ('auto','portrait','landscape') or mode not in ('selected','full'):return self.send_err(400,'播放方式无效')
+            records=read_samples(os.path.join(DATA_DIR,'memories.db'),lib['id'],cont['items'],identity,root=lib['root'],layout=layout,mode=mode)
+            if detail and records is None:return self.send_err(404,'这段回忆暂时不可用')
+            if items:
+                off=max(0,int((qs.get('off') or ['0'])[0]));lim=min(120,max(1,int((qs.get('lim') or ['120'])[0])))
+                return self.send_json(dict(total=len(records['photos']),title=records['title'],revision=records['revision'],off=off,lim=lim,items=[dict(self.item_public(p['item']),captured=p['captured']) for p in records['photos'][off:off+lim]]))
+            entities,_=snapshot(os.path.join(DATA_DIR,'vision.db'),lib['id'],cont['items'])
+            def public(record):
+                result={k:v for k,v in record.items() if k not in ('photos','all_photos','candidates','cover')}
+                result['people']=[dict(id=p['id'],name=entities[p['id']]['name']) for p in record['people'] if p['id'] in entities]
+                result['cover']=self.item_public(record['cover'])
+                if detail:result['photos']=[dict(item=self.item_public(p['item']),captured=p['captured']) for p in record['photos'][:120]]
+                return result
+            return self.send_json(public(records) if detail else {'stories':[public(r) for r in records]})
+        except (sqlite3.Error,ValueError,KeyError):return self.send_err(503,'回忆暂时无法读取')
+
+    def api_memory_edit(self):
+        code,msg=self.admin_guard()
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        from memory_stories import edit_story,read_samples
+        try:
+            body=self.read_json()
+            if not isinstance(body,dict) or type(body.get('revision')) is not int:raise ValueError('Invalid revision')
+            lib,cont,err=self._scope_container({'lib':[body.get('lib','')]})
+            if err:return self.send_err(*err)
+            identity=body.get('id','')
+            if not isinstance(identity,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',identity):raise ValueError('Invalid memory')
+            current=read_samples(os.path.join(DATA_DIR,'memories.db'),lib['id'],cont['items'],identity,root=lib['root'],mode='full')
+            if current is None:return self.send_err(404,'回忆不存在')
+            changes=body.get('changes',{})
+            if 'cover_rel' in changes and changes['cover_rel'] not in {p['rel'] for p in current['photos']}:raise ValueError('Unavailable cover')
+            revision=edit_story(os.path.join(DATA_DIR,'memories.db'),lib['id'],identity,changes,body['revision'])
+            return self.send_json({'revision':revision})
+        except RuntimeError:return self.send_err(409,'回忆已在其他页面修改，请重新打开后再保存')
+        except (ValueError,KeyError,TypeError,AttributeError):return self.send_err(400,'开场信息无效')
+        except sqlite3.Error:return self.send_err(503,'回忆暂时无法保存')
+
+    def api_memory_organize(self):
+        code,msg=self.admin_guard()
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        from memory_stories import read_samples,organize_stories
+        from vision_albums import snapshot
+        try:
+            body=self.read_json()
+            if not isinstance(body,dict):raise ValueError('Invalid action')
+            lib,cont,err=self._scope_container({'lib':[body.get('lib','')]})
+            if err:return self.send_err(*err)
+            ids=body.get('ids',[])
+            if not isinstance(ids,list) or len(ids)>2 or any(not isinstance(i,str) for i in ids) or len(ids)!=len(set(ids)):raise ValueError('Invalid memories')
+            records=[read_samples(os.path.join(DATA_DIR,'memories.db'),lib['id'],cont['items'],identity,root=lib['root'],mode='full') for identity in ids]
+            if any(r is None for r in records):raise ValueError('回忆不存在')
+            entities,assignments=snapshot(os.path.join(DATA_DIR,'vision.db'),lib['id'],cont['items'])
+            created=organize_stories(os.path.join(DATA_DIR,'memories.db'),lib['id'],records,body.get('action'),body.get('revisions',{}),entities,assignments,body.get('split_at',''))
+            return self.send_json({'created':created})
+        except RuntimeError:return self.send_err(409,'事件已有修改，请重新打开后再整理')
+        except (ValueError,KeyError,TypeError,AttributeError) as error:return self.send_err(400,str(error))
+        except sqlite3.Error:return self.send_err(503,'事件暂时无法整理')
+
+    def api_growth_cover(self):
+        code,msg=self.admin_guard()
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        from vision_albums import snapshot,album,set_growth_cover
+        try:
+            body=self.read_json()
+            lib,cont,err=self._scope_container({'lib':[body.get('lib','')]})
+            if err:return self.send_err(*err)
+            entities,assignments=snapshot(os.path.join(DATA_DIR,'vision.db'),lib['id'],cont['items'])
+            entity=body['entity'];result=album(entities,assignments,cont['items'],[entity])
+            set_growth_cover(os.path.join(DATA_DIR,'album_growth.db'),lib['id'],entity,body['period'],body['rel'],result['items'])
+            return self.send_json({'saved':True})
+        except (ValueError,KeyError,TypeError,AttributeError):return self.send_err(400,'请选择这个时期的已归档照片')
+        except sqlite3.Error:return self.send_err(503,'封面暂时无法保存')
+
+    def api_vision_albums(self, qs, detail=False):
+        code,msg=self.admin_guard(need_header=False)
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        lib,cont,err=self._scope_container(qs)
+        if err:return self.send_err(*err)
+        from vision_albums import snapshot,directory,album
+        try:
+            entities,assignments=snapshot(os.path.join(DATA_DIR,'vision.db'),lib['id'],cont['items'])
+            if not detail:
+                albums=directory(entities,assignments,cont['items'])
+                return self.send_json({'albums':[dict(a,cover=self.item_public(a['cover'])) for a in albums]})
+            ids=[eid for eid in (qs.get('ids') or [''])[0].split(',') if eid]
+            month=(qs.get('ym') or [''])[0]
+            if month and month!='unknown' and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',month):raise ValueError('Invalid month')
+            memory=(qs.get('memory') or [''])[0]
+            if memory=='month' and not month:raise ValueError('Choose a month')
+            result=album(entities,assignments,cont['items'],ids,month,memory)
+            if (qs.get('growth') or [''])[0]=='1':
+                if len(ids)!=1 or memory:raise ValueError('Choose one identity')
+                from vision_albums import growth
+                stages=growth(os.path.join(DATA_DIR,'album_growth.db'),lib['id'],ids[0],result['items'])
+                return self.send_json({'title':result['title'],'total':len(result['items']),'stages':[dict(stage,cover=self.item_public(stage['cover']),previews=[self.item_public(p) for p in stage['previews']]) for stage in stages]})
+
+            off=max(0,int((qs.get('off') or ['0'])[0]));lim=min(120,max(1,int((qs.get('lim') or ['120'])[0])))
+            return self.send_json(dict(total=len(result['items']),off=off,lim=lim,title=result['title'],months=result['months'],partners=result['partners'],items=[self.item_public(it) for it in result['items'][off:off+lim]]))
+        except ValueError:return self.send_err(400,'相册筛选条件无效')
+        except sqlite3.Error:return self.send_err(503,'相册暂时无法读取，请稍后重试')
+
+    def api_vision_status(self):
+        code,msg=self.admin_guard(need_header=False)
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        return self.send_json(VISION.snapshot() if VISION else {"available":False,"running":False})
+
+    def api_vision_control(self):
+        code,msg=self.admin_guard()
+        if code:return self.send_need_auth(msg) if code==401 else self.send_err(code,msg)
+        if VISION is None:return self.send_err(503,'识别后台尚未启动')
+        try:
+            body=self.read_json()
+            return self.send_json(VISION.action(body.get('action') if isinstance(body,dict) else None))
+        except ValueError:return self.send_err(400,'不支持的识别操作')
+
     def api_index_scan(self):
         """POST /api/index/scan {full:0|1}
         触发一次后台索引并立即返回；前端轮询 /api/index/progress 看进度。
@@ -5446,6 +5618,14 @@ class Handler(BaseHTTPRequestHandler):
         if not kw:
             return self.send_json({"total": 0, "off": off, "lim": lim, "items": []})
         hits = [it for it in cont["items"] if kw in it["n"].lower()]
+        # Private identity names never participate in public or shared searches.
+        if not self.from_public() and self.admin_authed():
+            from vision_albums import snapshot
+            try:
+                entities,assignments=snapshot(os.path.join(DATA_DIR,'vision.db'),lib['id'],cont['items'])
+                ids={eid for eid,e in entities.items() if kw in e['name'].lower()}
+                hits=[it for it in cont['items'] if kw in it['n'].lower() or ids.intersection(assignments.get(it['p'],()))]
+            except sqlite3.Error:pass # File-name search remains available.
         return self.send_json({"total": len(hits), "off": off, "lim": lim,
                                "items": [self.item_public(it)
                                          for it in hits[off:off + lim]]})
@@ -5665,6 +5845,7 @@ class Handler(BaseHTTPRequestHandler):
         return thumb_work.views.register(identity, (qs.get("_slview") or [""])[0],
                                          (qs.get("_slepoch") or [""])[0])
 
+    @vision_media
     def serve_image(self, qs, kind):
         code, msg = self._media_precheck(qs)
         if code:
@@ -5705,6 +5886,7 @@ class Handler(BaseHTTPRequestHandler):
                                # share 一律 private,no-store：撤销后 CF 不能继续供图
                                cache=self.media_cache("public, max-age=604800"))
 
+    @vision_media
     def serve_raw(self, qs):
         code, msg = self._media_precheck(qs)
         if code:
@@ -5723,6 +5905,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream_file(fp, start, end, total, ctype, 206, cache=cache)
         return self._stream_file(fp, 0, total - 1, total, ctype, 200, cache=cache)
 
+    @vision_media
     def serve_video(self, qs):
         """MOV/MP4，Range 流式；t=1 时 HEVC→H.264 转码"""
         code, msg = self._media_precheck(qs)
@@ -5914,10 +6097,12 @@ def _bootstrap_async(rc, pt):
     # ★ 独立视频封面预热（低优先级后台）：把「滚到才抽帧」的空白期提前消化掉
     threading.Thread(target=warm_video_thumbnails, name="warm-video-thumbs",
                      daemon=True).start()
+    start_vision_runtime()
 
 
 def main():
     global FFMPEG, INDEX, CACHE_INDEX, TRASH, TS_OVERRIDES_PATH_ARG
+    global VISION_AUTOSTART
     port, token, lan, init_only = None, None, False, False
     rebuild, recheck = False, None
     i = 1
@@ -6059,6 +6244,7 @@ def main():
 
     # ★ 首次索引放到后台线程（端口已开始监听）：页面无需空等，
     #   前端定时轮询 /api/index/progress，不挂着一个请求等索引结束。
+    VISION_AUTOSTART=True
     threading.Thread(target=_bootstrap_async, args=(rc, pt),
                      name="bootstrap", daemon=True).start()
 
@@ -6069,6 +6255,7 @@ def main():
     finally:
         _recheck_stop.set()
         _purge_stop.set()
+        if VISION:VISION.stop()
         httpd.server_close()
         if INDEX:
             INDEX.close()

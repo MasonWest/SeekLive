@@ -62,20 +62,18 @@ const mAhead = src.match(/const\s+THUMB_AHEAD\s*=\s*(\d+)\s*;/);
 chk('定义 THUMB_AHEAD（视口外预取余量）', !!mAhead, mAhead ? mAhead[0] : '未找到');
 
 // 2. 网格不再直接把 src 写进 HTML
-const paint = src.match(/function\s+paintGrid\s*\([\s\S]*?\n\}/);
-chk('找到 paintGrid', !!paint);
+const paint = src.match(/function\s+createPhotoTile\s*\([\s\S]*?\n\}/);
+chk('找到 createPhotoTile', !!paint);
 const paintSrc = paint ? paint[0] : '';
-chk('paintGrid 的 <img> 不再带 src= 属性',
+chk('createPhotoTile 的 <img> 不再带 src= 属性',
   !/<img[^>]*\$\{thumbURL\(/.test(paintSrc) && !/`<img[^>]*src=/i.test(paintSrc));
-chk('paintGrid 设置 data-thumb-url（交给节流器）',
+chk('createPhotoTile 设置 data-thumb-url（交给节流器）',
   /dataset\.thumbUrl\s*=\s*thumbURL\(/.test(paintSrc));
-chk('paintGrid 把条目挂在 tile 上（供失败重试）', /a\.item\s*=\s*it/.test(paintSrc));
-chk('paintGrid 把图片交给观察器', /thumbObserver\.observe\(/.test(paintSrc));
+chk('createPhotoTile 把条目挂在 tile 上（供失败重试）', /a\.item\s*=\s*it/.test(paintSrc));
+chk('createPhotoTile 把图片交给观察器', /thumbObserver\.observe\(/.test(src.match(/function paintWindow\([^]*?\n\}/)[0]));
 
-const paintSearch = src.match(/function\s+paintSearch\s*\([\s\S]*?\n\}/);
-chk('搜索结果同样走节流器',
-  !!paintSearch && /dataset\.thumbUrl\s*=\s*thumbURL\(/.test(paintSearch[0])
-  && !/<img[^>]*\$\{thumbURL\(/.test(paintSearch[0]));
+chk('搜索结果复用分页和视口渲染',
+  /fetchBrowsePage\(context, 0\)/.test(src) && /loadGridWindow\(grid, context, r.total\)/.test(src));
 
 // 3. 节流器本体
 chk('存在 IntersectionObserver 驱动的入队', /thumbObserver\s*=\s*new IntersectionObserver\(/.test(src));

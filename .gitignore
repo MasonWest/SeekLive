@@ -14,6 +14,9 @@ cache/
 logs/
 tmp/
 
+# 本机照片识别的人工核对导出（姓名、身份合并与标注）
+/vision-review-*.json
+
 # 服务自身的运行时标记
 *.pid
 *.port
@@ -23,6 +26,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+/.venv-vision/
 venv/
 
 # ---------- 本机私有配置 ----------

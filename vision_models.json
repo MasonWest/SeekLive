@@ -1,0 +1,42 @@
+[
+  {
+    "file": "yunet.onnx",
+    "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2026may.onnx",
+    "source": "OpenCV Zoo",
+    "license": "MIT",
+    "bytes": 229738,
+    "sha256": "ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0"
+  },
+  {
+    "file": "sface.onnx",
+    "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+    "source": "OpenCV Zoo",
+    "license": "Apache-2.0",
+    "bytes": 38696353,
+    "sha256": "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"
+  },
+  {
+    "file": "yolox_nano.onnx",
+    "url": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx",
+    "source": "YOLOX official release",
+    "license": "Apache-2.0",
+    "bytes": 3659407,
+    "sha256": "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d"
+  },
+  {
+    "file": "pet_small.onnx",
+    "url": "https://huggingface.co/open-noodle/pet-recognition-small/resolve/9dd4c915be29a81b116b3e30eb996c59d0e7ede0/recognition/model.onnx",
+    "source": "open-noodle model card",
+    "license": "Apache-2.0 (publisher declaration)",
+    "bytes": 89227604,
+    "sha256": "6a5e2373ab348bed588cef4072f3914ca9c8bacde3e8d0651019e8dad86b24ba"
+  },
+  {
+    "file": "yolox_s.onnx",
+    "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/object_detection_yolox/object_detection_yolox_2022nov.onnx",
+    "source": "OpenCV Zoo YOLOX-S",
+    "license": "Apache-2.0",
+    "bytes": 35858002,
+    "sha256": "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
+  }
+]

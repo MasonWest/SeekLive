@@ -1,0 +1,6 @@
+# Optional background worker; Pillow/pillow-heif come from the gallery runtime.
+opencv-python-headless==5.0.0.93
+onnxruntime==1.31.1
+numpy==2.1.2
+flatbuffers==25.12.19
+protobuf==7.36.2

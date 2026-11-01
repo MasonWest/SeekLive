@@ -1,0 +1,329 @@
+<html lang="zh-CN" class="grp-day" data-density="l2" style="--cols: 11; --topbar-h: 57px; --rail-h: 43px;"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0f" media="(prefers-color-scheme:dark)">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme:light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="时光轴">
+<meta name="format-detection" content="telephone=no">
+<title>我们的家 · 时光轴</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="favicon.svg">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ── 启动 / 加载态 ───────────────────────────────── -->
+<div id="splash" class="splash hide">
+  <div class="splash-logo">
+    <svg viewBox="0 0 48 48" width="56" height="56" aria-hidden="true">
+      <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#7c6bff"></stop><stop offset="1" stop-color="#ec5f96"></stop>
+      </linearGradient></defs>
+      <rect x="4" y="6" width="40" height="36" rx="11" fill="url(#g1)"></rect>
+      <circle cx="24" cy="24" r="9.5" fill="none" stroke="#fff" stroke-width="2.4" opacity=".95"></circle>
+      <circle cx="24" cy="24" r="3.4" fill="#fff"></circle>
+      <circle cx="33.5" cy="15" r="2.6" fill="#fff" opacity=".9"></circle>
+    </svg>
+  </div>
+  <div class="splash-title">时光轴</div>
+  <div class="splash-sub" id="splashSub">正在建立索引…</div>
+  <div class="splash-bar"><i></i></div>
+  <!-- 未授权访客（anon）：壳能匿名拿到，但看不到任何照片数据，这里给一个入口 -->
+  <button class="splash-btn" id="gateLogin" hidden="">输入管理口令</button>
+</div>
+
+<!-- ── 顶栏 ───────────────────────────────────────── -->
+<header class="topbar" id="topbar">
+  <div class="tb-row">
+    <button class="icon-btn" id="btnMenu" aria-label="跳转月份">
+      <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"></path></svg>
+    </button>
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span id="brandName">我们的家</span>
+    </div>
+    <div class="tb-right">
+      <button class="icon-btn" id="btnSearch" aria-label="搜索">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="M16 16l4.5 4.5"></path></svg>
+      </button>
+      <button class="icon-btn" id="btnSelect" aria-label="选择照片">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"></circle><path d="M8.4 12.3l2.5 2.5 4.7-5.3"></path></svg>
+      </button>
+      <button class="icon-btn" id="btnTrash" aria-label="最近删除">
+        <svg viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.9 12.3h8.6L17.2 7M10.2 10.6v5.6M13.8 10.6v5.6"></path></svg>
+      </button>
+      <button class="icon-btn" id="btnIdx" aria-label="索引进度">
+        <svg viewBox="0 0 24 24"><path d="M12 3.6v6.2M12 20.4v-6.2M3.6 12h6.2M20.4 12h-6.2"></path><circle cx="12" cy="12" r="3.1"></circle></svg>
+        <span class="idx-dot" id="idxDot" hidden=""></span>
+      </button>
+      <button class="icon-btn" id="btnDensity" aria-label="调整大小">
+        <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"></rect><rect x="13.5" y="3.5" width="7" height="7" rx="2"></rect><rect x="3.5" y="13.5" width="7" height="7" rx="2"></rect><rect x="13.5" y="13.5" width="7" height="7" rx="2"></rect></svg>
+      </button>
+      <button class="icon-btn" id="btnInfo" aria-label="信息">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 11v5.5M12 7.8v.2"></path></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="tb-chips" id="chips" style="display: none;"><button class="chip on" data-lib="t">我们的家<span class="c-n">18</span></button></div>
+
+  <div class="tb-search" id="searchBar" hidden="">
+    <svg class="s-ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="M16 16l4.5 4.5"></path></svg>
+    <input id="searchInput" type="search" placeholder="搜索文件名…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button class="s-cancel" id="searchCancel">完成</button>
+  </div>
+
+  <!-- ── 分享模式提示条（只读访客；放在 topbar 内 → 高度自动纳入 --topbar-h） ── -->
+  <div class="share-bar" id="shareBar" hidden="">
+    <span class="sh-ico">🔗</span>
+    <span class="sh-text" id="shareBarText"></span>
+  </div>
+</header>
+
+<!-- ── 年份 / 月份导航（< 2025 > 快速切换） ─────────── -->
+<nav class="rail" id="rail" aria-label="时间导航">
+  <div class="rail-row">
+    <button class="rail-nav" id="yrPrev" aria-label="更早一年" disabled="">
+      <svg viewBox="0 0 24 24"><path d="M14.5 5L8 12l6.5 7"></path></svg>
+    </button>
+    <button class="rail-year" id="yrLabel" aria-label="全部年份">2026 年</button>
+    <button class="rail-nav" id="yrNext" aria-label="更新一年" disabled="">
+      <svg viewBox="0 0 24 24"><path d="M9.5 5L16 12l-6.5 7"></path></svg>
+    </button>
+    <div class="rail-months" id="railMonths"><button class="rm on" data-ym="2026-10" title="18 张">10月</button></div>
+  </div>
+</nav>
+
+<!-- ── 主区 ──────────────────────────────────────── -->
+<main id="main">
+  <div id="timeline" class="timeline"><div class="year-sep" data-yr="2026">2026 年<span>18 张</span></div><div class="month-sep" data-ym="2026-10">2026 年 10 月<span>18 张</span></div><section class="day-blk" data-key="2026-10|08" data-ym="2026-10" data-d="08" data-total="12"><div class="day-hd"><span>10 月 8 日</span><span class="d-n">12 张</span><label class="d-pick" title="选中 / 取消这一天的全部照片"><input type="checkbox" class="d-pick-cb" aria-label="选中这一天"></label><span class="d-w">周四</span></div><div class="grid" style="" data-painted="1"><a class="tile loaded" href="javascript:void 0" data-idx="0" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0012.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0012.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0012.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="1" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0011.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0011.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0011.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="2" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0010.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0010.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0010.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="3" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0009.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0009.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0009.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="4" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0008.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0008.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0008.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="5" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0007.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0007.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0007.JPG&amp;s=640" style="object-fit: contain;"></a><a class="tile loaded" href="javascript:void 0" data-idx="6" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0006.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0006.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0006.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="7" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0005.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0005.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0005.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="8" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0004.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0004.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0004.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="9" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0003.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0003.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0003.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="10" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0002.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0002.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0002.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="11" data-ctx="2026-10|08"><span class="pick"></span><img alt="IMG_0001.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0001.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0001.JPG&amp;s=640"></a></div></section><section class="day-blk" data-key="2026-10|03" data-ym="2026-10" data-d="03" data-total="6"><div class="day-hd"><span>10 月 3 日</span><span class="d-n">6 张</span><label class="d-pick" title="选中 / 取消这一天的全部照片"><input type="checkbox" class="d-pick-cb" aria-label="选中这一天"></label><span class="d-w">周六</span></div><div class="grid" style="" data-painted="1"><a class="tile loaded" href="javascript:void 0" data-idx="0" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0018.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0018.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0018.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="1" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0017.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0017.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0017.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="2" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0016.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0016.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0016.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="3" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0015.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0015.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0015.JPG&amp;s=640"></a><a class="tile loaded" href="javascript:void 0" data-idx="4" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0014.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0014.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0014.JPG&amp;s=640" style="object-fit: contain;"></a><a class="tile loaded" href="javascript:void 0" data-idx="5" data-ctx="2026-10|03"><span class="pick"></span><img alt="IMG_0013.JPG" decoding="async" data-thumb-url="/thumb?lib=t&amp;p=IMG_0013.JPG&amp;s=640" src="/thumb?lib=t&amp;p=IMG_0013.JPG&amp;s=640"></a></div></section></div>
+  <div id="sentinel" class="sentinel"></div>
+  <div id="endTip" class="end-tip">已经到底啦</div>
+</main>
+
+<!-- 回到顶部 -->
+<button id="toTop" class="to-top" aria-label="回到顶部" hidden="">
+  <svg viewBox="0 0 24 24"><path d="M12 19V6M6 12l6-6 6 6"></path></svg>
+</button>
+
+<!-- ── 照片墙密度控制（五档：大图 / 标准 / 密集 / 月份 / 年份）────
+     常驻可见： − 更密集（每行更多） ｜ 中间显示当前档并可打开五档面板 ｜ + 更宽松
+     只改 CSS 列数与时间层级，不改图片 URL —— 缩略图始终是单档 640。 -->
+<div id="denCtl" class="den-ctl">
+  <button class="den-btn" id="denOut" type="button" aria-label="更密集（每行更多）">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12"></path></svg>
+  </button>
+  <button class="den-mid" id="denMid" type="button" aria-haspopup="dialog" aria-label="照片大小" title="照片大小：标准">
+    <span class="den-name" id="denName">标准</span>
+    <span class="den-dots" id="denDots" aria-hidden="true"><i></i><i></i><i></i><i class="on"></i><i></i></span>
+  </button>
+  <button class="den-btn" id="denIn" type="button" aria-label="更宽松（每行更少）">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v12M6 12h12"></path></svg>
+  </button>
+</div>
+
+<!-- ── 灯箱 ──────────────────────────────────────── -->
+<div id="viewer" class="viewer" hidden="">
+  <div class="v-stage" id="vStage" style="touch-action: none;">
+    <div class="v-media" id="vMedia"></div>
+  </div>
+
+  <div class="v-chrome v-top" id="vTop">
+    <button class="v-btn" id="vClose" aria-label="关闭">
+      <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+    </button>
+    <div class="v-title" id="vTitle"></div>
+    <div class="v-actions">
+      <button class="v-btn" id="vLive" hidden="" aria-label="实况">
+        <span class="live-pill"><i></i>LIVE</span>
+      </button>
+      <button class="v-btn" id="vSound" hidden="" aria-label="实况声音" title="实况声音">
+        <svg viewBox="0 0 24 24">
+          <path d="M4 9.4h3.3L11.4 6v12L7.3 14.6H4z"></path>
+          <path class="s-on" d="M14.8 9.3a4 4 0 010 5.4M17.4 6.9a7.4 7.4 0 010 10.2"></path>
+          <path class="s-off" d="M15.3 9.9l4.2 4.2M19.5 9.9l-4.2 4.2"></path>
+        </svg>
+      </button>
+      <button class="v-btn v-danger" id="vDel" hidden="" aria-label="移入回收站">
+        <svg viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.9 12.3h8.6L17.2 7M10.2 10.6v5.6M13.8 10.6v5.6"></path></svg>
+      </button>
+      <button class="v-btn" id="vDownload" aria-label="下载">
+        <svg viewBox="0 0 24 24"><path d="M12 4v11M7.5 11.5L12 16l4.5-4.5M5 19h14"></path></svg>
+      </button>
+      <button class="v-btn" id="vInfoBtn" aria-label="详情">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 11v5.5M12 7.8v.2"></path></svg>
+      </button>
+    </div>
+  </div>
+
+  <button class="v-nav v-prev" id="vPrev" aria-label="上一张">
+    <svg viewBox="0 0 24 24"><path d="M14.5 5L8 12l6.5 7"></path></svg>
+  </button>
+  <button class="v-nav v-next" id="vNext" aria-label="下一张">
+    <svg viewBox="0 0 24 24"><path d="M9.5 5L16 12l-6.5 7"></path></svg>
+  </button>
+
+  <div class="v-chrome v-bottom" id="vBottom">
+    <div class="v-caption" id="vCaption"></div>
+  </div>
+</div>
+
+<!-- ── 详情抽屉 ──────────────────────────────────────
+     独立于灯箱：灯箱内可看单张详情，顶栏 ⓘ 也能在灯箱关闭时打开 -->
+<div class="v-detail" id="vDetail" hidden="">
+  <div class="vd-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head">详情</div>
+    <dl id="vdList"></dl>
+    <button class="vd-mini" id="vdAdminBtn" hidden=""></button>
+    <button class="vd-close" id="vdClose">关闭</button>
+  </div>
+</div>
+
+<!-- ── 月份跳转面板 ───────────────────────────────── -->
+<div id="sheet" class="sheet" hidden="">
+  <div class="sheet-bg" data-close=""></div>
+  <div class="sheet-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head">跳转到月份</div>
+    <div class="sheet-scroll" id="monthList"><button class="m-item" data-ym="2026-10"><div class="mym">2026 年 10 月</div><div class="mn">18 张</div></button></div>
+    <div class="sheet-foot">
+      <button class="sf-btn" id="btnRefresh">
+        ↻ 重新扫描索引<span class="sf-n" id="refreshHint"></span>
+      </button>
+      <button class="sf-btn sf-warn" id="btnGc">
+        🧹 孤儿缓存清理<span class="sf-n" id="gcHint"></span>
+      </button>
+      <button class="sf-btn" id="btnShareManage">🔗 分享管理</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 照片大小（五档）选择面板 ───────────────────── -->
+<div id="denSheet" class="sheet" hidden="">
+  <div class="sheet-bg" data-close=""></div>
+  <div class="sheet-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head">照片大小</div>
+    <div class="sheet-scroll" id="denList"></div>
+  </div>
+</div>
+
+<!-- ── 最近删除（回收站） ───────────────────────────── -->
+<div id="trashSheet" class="sheet" hidden="">
+  <div class="sheet-bg" data-close=""></div>
+  <div class="sheet-card trash-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head t-hd">
+      <span>🗑 最近删除</span>
+      <span class="t-right" id="trashHint"></span>
+    </div>
+    <div class="t-note" id="trashNote" hidden=""></div>
+    <div class="t-bar" id="trashBar" hidden="">
+      <button class="t-mini" id="trashAll">全选</button>
+      <label class="t-mini t-pol">冲突
+        <select id="trashPolicy">
+          <option value="skip">跳过</option>
+          <option value="rename">改名</option>
+        </select>
+      </label>
+      <span class="t-grow"></span>
+      <button class="t-mini t-ok" id="trashRestore" disabled="">恢复所选</button>
+      <button class="t-mini t-danger" id="trashPurge" disabled="">永久删除</button>
+    </div>
+    <div class="sheet-scroll t-list" id="trashList"></div>
+    <div class="sheet-foot">
+      <button class="sf-btn sf-warn" id="btnEmptyTrash" disabled="">
+        🗑 清空回收站<span class="sf-n" id="emptyHint"></span>
+      </button>
+      <button class="sf-btn" id="btnTrashReload">↻ 刷新回收站</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 索引进度面板（轻量：只读状态 + 轮询，不引入任务系统）──── -->
+<div id="idxSheet" class="sheet" hidden="">
+  <div class="sheet-bg" data-close=""></div>
+  <div class="sheet-card idx-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head t-hd">
+      <span>🔍 索引进度</span>
+      <span class="t-right" id="idxHint"></span>
+    </div>
+    <div class="sheet-scroll ix-scroll">
+      <div class="ix-stage" id="idxStage">读取中…</div>
+      <div class="ix-bar-wrap" id="idxBarWrap" hidden="">
+        <div class="ix-bar" id="idxBar"><i id="idxFill"></i></div>
+        <div class="ix-nums" id="idxNums"></div>
+      </div>
+      <div class="ix-inc" id="idxInc" hidden=""></div>
+      <div class="ix-err" id="idxErr" hidden=""></div>
+      <dl class="ix-kv" id="idxKv"></dl>
+    </div>
+    <div class="sheet-foot">
+      <button class="sf-btn" id="btnIdxRescan">↻ 立即重新扫描</button>
+      <button class="sf-btn" id="btnIdxClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 选择模式操作条 ─────────────────────────────── -->
+<div id="selBar" class="sel-bar" hidden="">
+  <button class="sb-cancel" id="selCancel">取消</button>
+  <button class="sb-month" id="selMonth">全选本月</button>
+  <span class="sb-count" id="selCount">已选 0 项</span>
+  <button class="sb-share" id="selShare" disabled="">生成分享</button>
+  <button class="sb-del" id="selDelete" disabled="">移入回收站</button>
+</div>
+
+<!-- ── 分享管理（管理端：列出 / 撤销） ───────────────── -->
+<div id="shareSheet" class="sheet" hidden="">
+  <div class="sheet-bg" data-close=""></div>
+  <div class="sheet-card">
+    <div class="vd-grab"></div>
+    <div class="vd-head t-hd">
+      <span>🔗 分享管理</span>
+      <span class="t-right" id="shareHint"></span>
+    </div>
+    <div class="t-note" id="shareNote" hidden=""></div>
+    <div class="sheet-scroll t-list" id="shareList"></div>
+    <div class="sheet-foot">
+      <button class="sf-btn" id="btnShareReload">↻ 刷新</button>
+      <button class="sf-btn" id="btnShareClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 二次确认 ────────────────────────────────────── -->
+<div id="confirm" class="cfm" hidden="">
+  <div class="cfm-bg" data-cfm-x=""></div>
+  <div class="cfm-card">
+    <div class="cfm-title" id="cfmTitle"></div>
+    <div class="cfm-body" id="cfmBody"></div>
+    <div class="cfm-foot">
+      <button class="cfm-btn" id="cfmNo">取消</button>
+      <button class="cfm-btn cfm-yes" id="cfmYes">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 回收站媒体预览 ──────────────────────────────── -->
+<div id="preview" class="cfm" hidden="">
+  <div class="cfm-bg" data-pv-x=""></div>
+  <div class="pv-card">
+    <div class="pv-head" id="pvTitle"></div>
+    <div class="pv-body" id="pvBody"></div>
+    <button class="cfm-btn" id="pvClose">关闭</button>
+  </div>
+</div>
+
+<!-- ── 提示 ──────────────────────────────────────── -->
+<div id="toast" class="toast" hidden=""></div>
+
+<script src="app.js"></script>
+
+
+</body><div id="codex-browser-sidebar-comments-root" style="position: fixed; inset: 0px; pointer-events: none; z-index: 2147483647;"></div></html>
