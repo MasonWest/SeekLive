@@ -1,12 +1,73 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>SeekLive · 家庭时光相册</title>
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7c6bff"/>
-      <stop offset="1" stop-color="#ec5f96"/>
+    <linearGradient id="bg" x1="32" y1="0" x2="456" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffe3aa"/><stop offset=".48" stop-color="#f7bda9"/><stop offset="1" stop-color="#e991ad"/>
     </linearGradient>
+    <linearGradient id="sky" x1="230" y1="104" x2="230" y2="354" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#aba1b4"/><stop offset=".48" stop-color="#efbaa6"/><stop offset=".78" stop-color="#ffd0a4"/><stop offset="1" stop-color="#b392aa"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="142" y1="96" x2="383" y2="426" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fffefa"/><stop offset="1" stop-color="#eef0f1"/>
+    </linearGradient>
+    <linearGradient id="shirt" x1="180" y1="260" x2="217" y2="356" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#928697"/><stop offset="1" stop-color="#64677f"/>
+    </linearGradient>
+    <linearGradient id="jacket" x1="334" y1="254" x2="328" y2="361" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#464455"/><stop offset="1" stop-color="#292d40"/>
+    </linearGradient>
+    <radialGradient id="glow"><stop stop-color="#c2eeff" stop-opacity=".9"/><stop offset="1" stop-color="#c2eeff" stop-opacity="0"/></radialGradient>
+    <filter id="shadow" x="-30%" y="-25%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#654c5a" flood-opacity=".28"/>
+    </filter>
+    <clipPath id="photo"><path d="M151 112H389V354H151z"/></clipPath>
   </defs>
-  <rect x="4" y="8" width="56" height="48" rx="15" fill="url(#g)"/>
-  <circle cx="32" cy="32" r="12.5" fill="none" stroke="#fff" stroke-width="3.2" opacity=".95"/>
-  <circle cx="32" cy="32" r="4.6" fill="#fff"/>
-  <circle cx="46" cy="20" r="3.4" fill="#fff" opacity=".9"/>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <!-- Loose prints behind the front instant photograph. -->
+  <g filter="url(#shadow)">
+    <g transform="rotate(-15 256 267)">
+      <rect x="125" y="87" width="270" height="350" rx="5" fill="#e9ebeb"/>
+      <path d="M138 102H382V363H138z" fill="#b5acb7"/>
+    </g>
+    <g transform="rotate(-10 256 267)">
+      <rect x="115" y="77" width="275" height="354" rx="5" fill="url(#paper)"/>
+      <path d="M129 92H376V359H129z" fill="#9b96a8"/>
+      <path d="M129 281 209 235 277 276 376 228V359H129z" fill="#cfb3b5"/>
+    </g>
+    <g transform="rotate(5 270 270)">
+      <rect x="137" y="97" width="266" height="333" rx="5" fill="url(#paper)"/>
+      <g clip-path="url(#photo)">
+        <path d="M151 112H389V354H151z" fill="url(#sky)"/>
+        <path d="M174 137c30-11 51-2 77-7-16 12-41 9-62 13-10 2-18 0-15-6Zm137 35c24-13 46-5 74-15-10 17-42 17-74 15Z" fill="#ffdab4" opacity=".36"/>
+        <path d="m151 282 42-17 54 21 50-16 48 10 44-23v97H151Z" fill="#ac8a9e"/>
+        <path d="m151 309 56-18 45 20 55-15 82 13v45H151Z" fill="#7e788f"/>
+        <!-- Mother leaning toward the children. -->
+        <path d="M188 257c-19 6-22 27-21 47l-3 50h85l-4-52-17-39Z" fill="url(#shirt)"/>
+        <path d="m207 248-4 18 17 15 8-17-6-18Z" fill="#ba897e"/>
+        <path d="M196 217c1-18 30-23 40-7l3 17-4 10 6 6-9 5-3 12-15 2-14-16Z" fill="#c89889"/>
+        <path d="M184 257c-9-3-10-10-7-15-7-5-6-11-2-16-5-7-1-12 3-16-1-8 4-12 10-14 0-7 7-11 14-10 5-7 12-7 18-3 7-3 13 0 16 5 8 0 12 6 10 12 6 5 5 11 0 16l-4 12-9-5-5-12-8 17-3 21-10 15-9-4-7 2Z" fill="#5b3d3c"/>
+        <path d="M183 284c-5 19-1 46 1 70m40-62 7 45" stroke="#55596f" stroke-width="2" stroke-linecap="round" opacity=".5"/>
+        <!-- Older child with long hair. -->
+        <path d="M265 251c-20 0-27 18-25 36l-5 19 51 6 8-15-9-29Z" fill="#4b363b"/>
+        <path d="M257 290c-16 7-19 23-20 38l-1 26h64l-7-44-18-20Z" fill="#dba6aa"/>
+        <path d="m262 284-2 13 12 9 7-12-4-15Z" fill="#bc887f"/>
+        <path d="M253 267c7-13 22-10 27 3l2 13-8 12-10-2-9-10Z" fill="#d39a88"/>
+        <path d="M251 277c-6-16 3-26 13-26 18 0 25 21 22 34l-7 7 1-17-9-16-11 4-6 17Z" fill="#51383d"/>
+        <!-- Father in profile, with an arm around the family. -->
+        <path d="m323 244-13 10-14 17-2 44-8 39h103V281l-36-33Z" fill="url(#jacket)"/>
+        <path d="m316 226-2 25 17 12 15-17-12-24Z" fill="#a87970"/>
+        <path d="M304 192c-11 3-16 14-13 27l-3 10 7 4 2 16 12 7 17-12 10-23-11-23Z" fill="#b98576"/>
+        <path d="M289 205c-11-10-4-21 7-25 6-8 23-6 30-2 16 2 22 14 20 28l-4 24-10-1-8-20-9-7-10 2-3 14-10-4Z" fill="#3e2c33"/>
+        <path d="m300 232 8 5 8-3 8-14 10 9-7 22-14 11-14-7-4-13Z" fill="#453137"/>
+        <path d="m347 270-8 58c-9 10-29 14-49 11l-21-1-3 11 29 8c27 3 56-2 64-20l8-55Z" fill="#303246"/>
+        <path d="m271 338-14-3-12 7 1 6 22 2Z" fill="#bd8d82"/>
+        <!-- Younger child in the foreground. -->
+        <path d="M233 321c-16 3-22 17-22 33h49l-5-21-12-10Z" fill="#e4bbba"/>
+        <path d="M225 310c-2-10 7-18 17-15l10 8 2 10-6 12-12 1-9-7Z" fill="#bf8c82"/>
+        <path d="M224 320c-14-8-12-23-4-29 4-7 13-8 19-4 9-4 18 2 17 10l-10 1-2 10-8-5-5 6 1 13Z" fill="#4b343b"/>
+        <ellipse cx="270" cy="355" rx="74" ry="16" fill="url(#glow)"/>
+      </g>
+      <path d="M151 112H389V354H151z" stroke="#e2d7d0"/>
+    </g>
+  </g>
 </svg>

@@ -4549,7 +4549,11 @@ class Handler(BaseHTTPRequestHandler):
     # 匿名白名单：**除这些之外一律需要授权**（新增接口默认受保护，不会漏）。
     #   静态外壳（页面/JS/CSS）匿名 → 前端拿到壳后用 /api/session 自判身份；
     #   /s/<token> 是分享落地页，凭 URL 里的令牌自校验。
-    ANON_GET = frozenset({
+    ICON_PATHS = frozenset({
+        "/icons/icon-192.png", "/icons/icon-512.png",
+        "/icons/icon-maskable-512.png", "/icons/apple-touch-icon.png",
+    })
+    ANON_GET = ICON_PATHS | frozenset({
         "/", "/index.html", "/app.css", "/app.js", "/favicon.svg",
         "/manifest.webmanifest",
         "/api/session",          # 统一身份接口（只回身份，不含任何相册数据）
@@ -4752,7 +4756,7 @@ class Handler(BaseHTTPRequestHandler):
         # 因此也不需要「入口下发 Cookie」这类补丁。
         if path in ("/", "/index.html"):
             return self.serve_static("index.html")
-        if path in ("/app.css", "/app.js", "/favicon.svg", "/manifest.webmanifest"):
+        if path in self.ICON_PATHS or path in ("/app.css", "/app.js", "/favicon.svg", "/manifest.webmanifest"):
             return self.serve_static(path.lstrip("/"))
 
         return self.send_err(404, "not found")

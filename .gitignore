@@ -60,6 +60,8 @@ github密钥.txt
 *.jpg
 *.jpeg
 *.png
+# Public app icons exported from web/favicon.svg.
+!/web/icons/*.png
 *.gif
 *.webp
 *.bmp
