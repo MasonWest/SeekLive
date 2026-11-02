@@ -9,8 +9,8 @@ async function main() {
   const svg = await fs.readFile(path.join(web, 'favicon.svg'), 'utf8');
   // Platforms supply their own corner masks. PNGs need an opaque full-bleed base.
   const square = svg;
-  // This compact photograph stack already fits the maskable safe circle.
-  const maskable = square;
+  // Inset the enlarged stack for launcher masks, keeping its full silhouette safe.
+  const maskable = square.replace('scale(1.34)', 'scale(1.12)');
   const out = path.join(web, 'icons');
   await fs.mkdir(out, { recursive: true });
   for (const [name, size, source] of [
