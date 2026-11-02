@@ -8,10 +8,9 @@ async function main() {
   const web = path.resolve(__dirname, '../web');
   const svg = await fs.readFile(path.join(web, 'favicon.svg'), 'utf8');
   // Platforms supply their own corner masks. PNGs need an opaque full-bleed base.
-  const square = svg.replace('rx="116" fill="url(#bg)"', 'fill="url(#bg)"');
-  // Keep the entire photograph stack within the central maskable safe circle.
-  const maskable = square.replace('<g filter="url(#shadow)">',
-    '<g transform="translate(256 256) scale(.82) translate(-256 -256)" filter="url(#shadow)">');
+  const square = svg;
+  // This compact photograph stack already fits the maskable safe circle.
+  const maskable = square;
   const out = path.join(web, 'icons');
   await fs.mkdir(out, { recursive: true });
   for (const [name, size, source] of [

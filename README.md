@@ -42,7 +42,7 @@
 - **截图/文档类竖长图自动完整显示**（不裁切），横向照片则铺满方格
 - 支持「添加到主屏幕」，打开后是全屏应用（PWA manifest）
 
-应用图标以 `web/favicon.svg` 为矢量源文件，采用暖色家庭相册构图。
+应用图标以 `web/favicon.svg` 为矢量源文件，采用灰蓝底色、奶油色叠放相纸与暖色爱心构图。
 `web/icons/` 包含 Android/PWA 的 192、512 像素图标、独立 maskable 图标及 iOS 的 180 像素图标；
 修改 SVG 后，可在装有 Node.js 和 `sharp` 的环境运行 `node tools/generate_icons.cjs` 重新导出。
 已添加到主屏幕的设备如果仍显示旧图标，可移除旧快捷方式后重新添加。
